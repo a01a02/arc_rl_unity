@@ -1,70 +1,121 @@
 using UnityEngine;
 
+/// <summary>
+/// Minimal continuous controller for a 4-wheeled car using WheelColliders.
+/// Exposes normalized steer/throttle and a collision flag.
+/// </summary>
+[RequireComponent(typeof(Rigidbody))]
 public class SimpleCarController : MonoBehaviour
 {
-    [Header("Wheel Colliders")]
-    public WheelCollider wheelFL, wheelFR, wheelRL, wheelRR;
+    [Header("Wheels")]
+    public WheelCollider wheelFL;
+    public WheelCollider wheelFR;
+    public WheelCollider wheelRL;
+    public WheelCollider wheelRR;
 
-    [Header("Wheel Meshes")]
-    public Transform meshFL, meshFR, meshRL, meshRR;
+    [Header("Visuals (optional)")]
+    public Transform visualFL;
+    public Transform visualFR;
+    public Transform visualRL;
+    public Transform visualRR;
 
-    [Header("Drive Settings")]
-    public float motorTorque = 1500f;
-    public float maxSteeringAngle = 30f;
+    [Header("Params")]
+    public float maxSteerAngle = 30f;
+    public float maxMotorTorque = 150f;
+    public float brakeTorque = 300f;
 
-    [Header("Wheel Visual Correction")]
-    public Vector3 visualRotationOffset = new Vector3(0, 0, 90);
+    [Header("Reset")]
+    public Transform spawnPoint;
 
-    private float currentSteer = 0f;
-    private float currentThrottle = 0f;
-    private bool overrideControl = false;
+    private Rigidbody _rb;
+    private float _currentSteer;     // degrees
+    private float _currentTorque;    // Nm
+    private float _steerNorm;        // [-1,1]
+    private bool _collisionFlag = false;
 
-    // Public method for RLClientSender to call
-    public void SetInputs(float steering, float throttle)
+    public float CurrentSteerNorm => _steerNorm;
+
+    void Awake()
     {
-        currentSteer = Mathf.Clamp(steering, -1f, 1f) * maxSteeringAngle;
-        currentThrottle = Mathf.Clamp(throttle, 0f, 1f) * motorTorque;
-        overrideControl = true;
+        _rb = GetComponent<Rigidbody>();
+        // Optional stability
+        _rb.centerOfMass += new Vector3(0f, -0.3f, 0.2f);
     }
 
     void FixedUpdate()
     {
-        float steer, motor;
-
-        if (overrideControl)
-        {
-            steer = currentSteer;
-            motor = currentThrottle;
-            overrideControl = false; // Reset override after applying
-        }
-        else
-        {
-            // Use Unity Input axes if no override
-            steer = Input.GetAxis("Horizontal") * maxSteeringAngle;
-            motor = Input.GetAxis("Vertical") * motorTorque;
-        }
-
-        // Apply steering
-        wheelFL.steerAngle = steer;
-        wheelFR.steerAngle = steer;
-
-        // Apply motor torque to rear wheels
-        wheelRL.motorTorque = motor;
-        wheelRR.motorTorque = motor;
-
-        // Update visual wheel meshes
-        UpdateWheel(wheelFL, meshFL);
-        UpdateWheel(wheelFR, meshFR);
-        UpdateWheel(wheelRL, meshRL);
-        UpdateWheel(wheelRR, meshRR);
+        ApplyToWheels();
+        UpdateVisuals();
     }
 
-    void UpdateWheel(WheelCollider collider, Transform visual)
+    public void SetInputs(float steerNorm, float throttleNorm)
     {
-        if (collider == null || visual == null) return;
+        _steerNorm = Mathf.Clamp(steerNorm, -1f, 1f);
+        float targetSteer = _steerNorm * maxSteerAngle;
+        float targetTorque = Mathf.Clamp01(throttleNorm) * maxMotorTorque;
 
-        collider.GetWorldPose(out Vector3 pos, out Quaternion rot);
-        visual.position = pos;
-        visual.rotation = rot * Quaternion.Euler(visualRotationOffset);
+        // Small smoothing
+        _currentSteer = Mathf.Lerp(_currentSteer, targetSteer, 0.2f);
+        _currentTorque = Mathf.Lerp(_currentTorque, targetTorque, 0.2f);
+    }
+
+    private void ApplyToWheels()
+    {
+        // Steering on front
+        wheelFL.steerAngle = _currentSteer;
+        wheelFR.steerAngle = _currentSteer;
+
+        // Torque on rear (or AWD if you prefer)
+        wheelRL.motorTorque = _currentTorque;
+        wheelRR.motorTorque = _currentTorque;
+
+        // Simple automatic braking when torque very low
+        float brake = (_currentTorque < 0.05f) ? brakeTorque * 0.2f : 0f;
+        wheelFL.brakeTorque = brake;
+        wheelFR.brakeTorque = brake;
+        wheelRL.brakeTorque = brake;
+        wheelRR.brakeTorque = brake;
+    }
+
+    private void UpdateVisuals()
+    {
+        UpdateWheelPose(wheelFL, visualFL);
+        UpdateWheelPose(wheelFR, visualFR);
+        UpdateWheelPose(wheelRL, visualRL);
+        UpdateWheelPose(wheelRR, visualRR);
+    }
+
+    private void UpdateWheelPose(WheelCollider col, Transform visual)
+    {
+        if (col == null || visual == null) return;
+        Vector3 pos; Quaternion rot;
+        col.GetWorldPose(out pos, out rot);
+        visual.SetPositionAndRotation(pos, rot);
+    }
+
+    public void ResetVehicle()
+    {
+        if (spawnPoint != null)
+        {
+            transform.SetPositionAndRotation(spawnPoint.position, spawnPoint.rotation);
+        }
+        _currentSteer = 0f;
+        _currentTorque = 0f;
+        _steerNorm = 0f;
+        _collisionFlag = false;
+    }
+
+    public bool ConsumeCollisionFlag()
+    {
+        bool f = _collisionFlag;
+        _collisionFlag = false;
+        return f;
+    }
+
+    void OnCollisionEnter(Collision c)
+    {
+        // Flag "meaningful" collisions; adjust threshold as needed
+        if (c.relativeVelocity.magnitude > 2.0f)
+            _collisionFlag = true;
     }
 }
