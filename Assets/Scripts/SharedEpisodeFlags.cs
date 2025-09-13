@@ -1,27 +1,31 @@
+/* SharedEpisodeFlags
+ * Optional shared container for episode state so multiple components can read/write
+ * without tight coupling. RLClientSender can write into it; HUDs can read from it.
+ * If you already use RLClientSender's public getters, you can skip this script. */
+
 using UnityEngine;
 
-public static class SharedEpisodeFlags
+public class SharedEpisodeFlags : MonoBehaviour
 {
-    public static bool GoalReached { get; private set; }
-    public static float GoalBonus { get; private set; }
+    [Header("Episode State (read/write)")]
+    public int stepCount = 0;
+    public float lastReward = 0f;
+    public bool done = false;
+    public bool truncated = false;
 
-    // Minor goals
-    public static int MinorGoalsReached { get; private set; }
+    [Header("Misc Telemetry (optional)")]
+    public float speedMps = 0f;
+    public float steerCmd = 0f;
+    public float throttleCmd = 0f;
 
-    // Off-road & kill
-    public static bool OffRoadContact { get; private set; } // true while inside an off-road trigger
-    public static bool KillNow { get; private set; } // end episode immediately
-
-    public static void SetGoal(float bonus) { GoalReached = true; GoalBonus = bonus; }
-    public static void AddMinorGoal() { MinorGoalsReached++; }
-    public static void SetOffRoad(bool v) { OffRoadContact = v; }
-    public static void TriggerKill() { KillNow = true; }
-
-    public static void ResetFlags()
+    public void ResetFlags()
     {
-        GoalReached = false; GoalBonus = 0f;
-        MinorGoalsReached = 0;
-        OffRoadContact = false;
-        KillNow = false;
+        stepCount = 0;
+        lastReward = 0f;
+        done = false;
+        truncated = false;
+        speedMps = 0f;
+        steerCmd = 0f;
+        throttleCmd = 0f;
     }
 }

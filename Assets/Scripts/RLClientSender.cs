@@ -1,498 +1,508 @@
+/*
+ * RLClientSender
+ * --------------
+ * Unity-side TCP server that streams RGB frames + reward flags to a Python client
+ * and receives (steer, throttle) actions each step.
+ *
+ * Protocol (matches live_unity_env.py):
+ *  Reset:
+ *    - Python → Unity: single byte 'R' (0x52)
+ *    - Unity → Python: immediately sends  len(u32 BE) | jpeg(len) | reward(f32 BE) | done(u8) | truncated(u8)
+ *  Step:
+ *    - Python → Unity: steer(f32 BE) + throttle(f32 BE)
+ *    - Unity → Python: len | jpeg | reward | done | truncated
+ *
+ * Observation: HWC uint8 RGB (e.g., 84x84x3), JPEG-encoded.
+ * Action: steer ∈ [-1,1], throttle ∈ [0,1]
+ *
+ * Notes
+ * - This component does NOT do any non-passive perception (no masks/flow).
+ * - Rewards/terminations are determined by trigger components (Goal, MinorGoal,
+ *   OffRoad, KillZone) and simple kinematics metrics (e.g., speed).
+ * - Capturing occurs on the main thread (LateUpdate). Networking runs on a background
+ *   thread reading actions and writing step payloads using thread-safe fields.
+ */
+
 using System;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
-using System.Collections;
-using System.Collections.Generic;
-using System.Reflection;
 using UnityEngine;
 
-[DefaultExecutionOrder(-50)]
+[DisallowMultipleComponent]
 public class RLClientSender : MonoBehaviour
 {
     [Header("Network")]
+    [Tooltip("TCP port to listen on (Python connects to this).")]
     public int port = 5556;
 
     [Header("Capture")]
     public Camera captureCamera;
-    [Range(16, 512)] public int outputWidth = 84;
-    [Range(16, 512)] public int outputHeight = 84;
-    [Range(10, 100)] public int jpegQuality = 80;
+    [Tooltip("Output image width in pixels.")]
+    public int outputWidth = 84;
+    [Tooltip("Output image height in pixels.")]
+    public int outputHeight = 84;
+    [Range(1, 100)]
+    public int jpegQuality = 80;
+
+    [Header("Control (read-only for other scripts)")]
+    [Tooltip("Last steer command received from Python [-1..1].")]
+    public float lastSteerCmd = 0f;
+    [Tooltip("Last throttle command received from Python [0..1].")]
+    public float lastThrottleCmd = 0f;
 
     [Header("Episode")]
+    [Tooltip("Max physics steps before truncation (0 = unlimited).")]
     public int maxSteps = 500;
-    public Transform startPoint;                  // where the car respawns on reset
-    public SimpleCarController controller;        // your driving script
-    public Rigidbody rb;                          // rigidbody on the car
 
-    [Header("Route / Goals")]
-    public RoutePath routePath;                   // empty with child waypoints (start -> goal)
-    public GoalTrigger finalGoal;                 // destination trigger (calls SharedEpisodeFlags.SetGoal)
-    public MinorGoalTrigger[] minorGoalsToReset;  // all minor goals to re-arm each episode
+    [Header("References")]
+    public Rigidbody carRb;
+    public SimpleCarController carController;
 
-    [Header("Reward Shaping")]
+    [Header("Reward Configuration")]
+    [Tooltip("Small shaping reward each step while alive.")]
     public float aliveReward = 0.01f;
-    public float forwardVelScale = 0.02f;
-    [Range(0f, 2f)] public float progressRewardScale = 0.6f;
-    [Range(0f, 1f)] public float headingPenaltyScale = 0.08f;
-    [Range(0f, 0.2f)] public float offRoadPenaltyPerStep = 0.03f;
+    [Tooltip("Scale for forward speed reward (m/s * scale).")]
+    public float forwardSpeedScale = 0.02f;
+    [Tooltip("Penalty per second when off road.")]
+    public float offRoadPenaltyPerSec = 0.5f;
 
-	[Header("Goal Rewards")]
-	public float minorGoalBonus = 0.3f;
-	private int _lastMinorCount = 0;
+    [Header("Terminations / Flags (hook up triggers)")]
+    public GoalTrigger finalGoal;
+    public MinorGoalTrigger[] minorGoals;
+    public OffRoadTrigger offRoad;
+    public KillZone killZone;
 
-    [Header("Bounds / Kill")]
-    public Vector2 mapMinXZ = new Vector2(-50f, -50f);
-    public Vector2 mapMaxXZ = new Vector2( 50f,  50f);
+    // internal state
 
-	[Header("Network Timing")]
-	[Range(1, 50)] public int netTickMs = 16; // sleep time for NetLoop (ms)
+    // Episode state (read/written only on main thread)
+    private int _stepCount = 0;
+    private bool _episodeDone = false;
+    private bool _episodeTruncated = false;
+    private float _lastReward = 0f;
 
-    // --- internal ---
+    // Off-road contact timer
+    private float _offRoadTimeAccum = 0f;
+
+    // Networking
     private TcpListener _listener;
     private Thread _netThread;
-    private volatile bool _running;
-    private volatile bool _clientConnected;
+    private volatile bool _shutdown = false;
+    private volatile bool _clientConnected = false;
 
-    private Texture2D _readbackTex;
-    private RenderTexture _rt;
-
-    private byte[] _latestJpeg = Array.Empty<byte>();
+    // Shared payload fields (updated on main thread, read on net thread)
     private readonly object _jpegLock = new object();
+    private byte[] _jpegBytes = Array.Empty<byte>();
+    private int _jpegLen = 0;
+    private volatile int _jpegStepIndex = -1; // step index that produced the jpeg
 
-    private volatile float _pendingSteer = 0f;
-    private volatile float _pendingThrottle = 0f;
-    private volatile bool _havePendingAction = false;
+    // Action mailbox (written by net thread, read in FixedUpdate)
+    private volatile float _steerMailbox = 0f;
+    private volatile float _throttleMailbox = 0f;
+    private volatile bool _resetRequested = false;
 
-    private int _stepCount = 0;
-    private volatile float _lastReward = 0f;
-    private volatile byte _lastDone = 0;
-    private volatile byte _lastTruncated = 0;
+    // Capture resources
+    private RenderTexture _rt;
+    private Texture2D _readTex;
 
-    private RouteProgress _route;
-
-    private static RLClientSender _singleton;
-
-    // queue for running actions on main thread
-    private readonly Queue<Action> _mainQueue = new Queue<Action>();
-
-    // -------------------- Unity Lifecycle --------------------
+    // Public accessors for HUDs
+    public int StepCount => _stepCount;
+    public float LastReward => _lastReward;
+    public bool EpisodeDone => _episodeDone;
+    public bool EpisodeTruncated => _episodeTruncated;
 
     void Awake()
     {
-        // Avoid duplicates
-        if (_singleton != null && _singleton != this)
-        {
-            Debug.LogWarning($"RLClientSender duplicate on '{gameObject.name}' — disabling this one.");
-            enabled = false;
-            return;
-        }
-        _singleton = this;
-
-        Application.runInBackground = true;
-
-        // Auto-assign camera/controller/rigidbody if not set
         if (captureCamera == null)
+            Debug.LogError("[RLClientSender] Capture Camera not assigned.");
+
+        if (carRb == null && carController != null)
+            carRb = carController.GetComponent<Rigidbody>();
+
+        SetupRenderTargets();
+    }
+
+    void OnEnable()
+    {
+        _shutdown = false;
+        StartNetworkThread();
+        SubscribeTriggers(true);
+    }
+
+    void OnDisable()
+    {
+        _shutdown = true;
+        StopNetworkThread();
+        SubscribeTriggers(false);
+        TeardownRenderTargets();
+    }
+
+    void OnApplicationQuit()
+    {
+        _shutdown = true;
+        StopNetworkThread();
+    }
+
+    private void SetupRenderTargets()
+    {
+        _rt = new RenderTexture(outputWidth, outputHeight, 16, RenderTextureFormat.ARGB32)
         {
-            captureCamera = GetComponentInChildren<Camera>(true);
-            if (captureCamera == null) captureCamera = Camera.main;
-            if (captureCamera == null)
-            {
-                var cams = FindObjectsOfType<Camera>(true);
-                if (cams.Length > 0) captureCamera = cams[0];
-            }
-        }
-        if (controller == null) controller = FindObjectOfType<SimpleCarController>();
-        if (controller != null && rb == null) rb = controller.GetComponent<Rigidbody>();
-
-        if (captureCamera == null) { Debug.LogError("RLClientSender: captureCamera not set."); enabled = false; return; }
-        if (controller == null)    { Debug.LogError("RLClientSender: controller not set.");    enabled = false; return; }
-        if (rb == null)            { Debug.LogError("RLClientSender: Rigidbody not found.");   enabled = false; return; }
-
-        // Route helper
-        if (routePath != null && routePath.waypoints != null && routePath.waypoints.Length >= 2)
-            _route = new RouteProgress(routePath.waypoints);
-
-        // RT + readback
-        _rt = new RenderTexture(outputWidth, outputHeight, 16, RenderTextureFormat.ARGB32);
+            antiAliasing = 1,
+            useMipMap = false
+        };
         _rt.Create();
-        captureCamera.targetTexture = _rt;
-        _readbackTex = new Texture2D(outputWidth, outputHeight, TextureFormat.RGB24, false);
+
+        _readTex = new Texture2D(outputWidth, outputHeight, TextureFormat.RGB24, false);
+        _readTex.Apply(false, false);
+
+        if (captureCamera != null)
+            captureCamera.targetTexture = _rt;
     }
 
-    void Start()
+    private void TeardownRenderTargets()
     {
-        // Start TCP server
-        _listener = new TcpListener(IPAddress.Any, port);
-        _listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-        _listener.Start();
-        _running = true;
+        if (captureCamera != null)
+            captureCamera.targetTexture = null;
 
-        _netThread = new Thread(NetLoop) { IsBackground = true };
-        _netThread.Start();
-
-        StartCoroutine(MainLoop());
-        Debug.Log($"RLClientSender: listening on 0.0.0.0:{port}");
-    }
-
-    void OnDestroy()
-    {
-        _running = false;
-        try { _listener?.Stop(); } catch { }
-        if (_netThread != null && _netThread.IsAlive)
+        if (_rt != null)
         {
-            try { _netThread.Join(250); } catch { }
-            if (_netThread.IsAlive) _netThread.Interrupt();
-        }
-        if (captureCamera != null) captureCamera.targetTexture = null;
-        try { _rt?.Release(); } catch { }
-        if (_singleton == this) _singleton = null;
-    }
-
-    void OnApplicationQuit() => _running = false;
-
-    // -------------------- Episode Control --------------------
-
-    private void ResetEpisode(bool hardResetPose = true)
-    {
-        SharedEpisodeFlags.ResetFlags();
-        _stepCount = 0;
-        _lastReward = 0f;
-        _lastDone = 0;
-        _lastTruncated = 0;
-		_lastMinorCount = 0;
-        _havePendingAction = false;
-        _pendingSteer = 0f;
-        _pendingThrottle = 0f;
-
-        if (_route != null) _route.Reset();
-
-        if (finalGoal != null) finalGoal.ResetForNewEpisode();
-        if (minorGoalsToReset != null)
-        {
-            foreach (var g in minorGoalsToReset)
-                if (g != null) g.ResetForNewEpisode();
+            _rt.Release();
+            Destroy(_rt);
+            _rt = null;
         }
 
-        if (hardResetPose && startPoint != null && controller != null)
+        if (_readTex != null)
         {
-            var t = controller.transform;
-            t.position = startPoint.position;
-            t.rotation = startPoint.rotation;
-            rb.velocity = Vector3.zero;
-            rb.angularVelocity = Vector3.zero;
-            SafeSetInputs(0f, 0f);
+            Destroy(_readTex);
+            _readTex = null;
         }
     }
 
-    // -------------------- Main Loops --------------------
+    // Trigger wiring
 
-    IEnumerator MainLoop()
+    private void SubscribeTriggers(bool on)
     {
-        var eof = new WaitForEndOfFrame();
-
-        // Prepare first episode so first 'R' returns a valid frame
-        ResetEpisode(true);
-
-        while (_running)
+        if (finalGoal != null)
         {
-            // drain main-thread jobs (e.g., reset from NetLoop)
-            lock (_mainQueue)
+            if (on) finalGoal.OnGoalReached += HandleFinalGoal;
+            else finalGoal.OnGoalReached -= HandleFinalGoal;
+        }
+        if (minorGoals != null)
+        {
+            foreach (var mg in minorGoals)
             {
-                while (_mainQueue.Count > 0)
-                    _mainQueue.Dequeue()?.Invoke();
+                if (mg == null) continue;
+                if (on) mg.OnMinorGoal += HandleMinorGoal;
+                else mg.OnMinorGoal -= HandleMinorGoal;
             }
-
-            // physics/control
-            yield return new WaitForFixedUpdate();
-
-            if (_clientConnected)
-            {
-                if (_havePendingAction)
-                {
-                    SafeSetInputs(_pendingSteer, _pendingThrottle);
-                    _havePendingAction = false;
-                }
-
-                bool done, truncated;
-                float r = ComputeRewardAndDone(out done, out truncated);
-                _lastReward = r;
-                _lastDone = (byte)(done ? 1 : 0);
-                _lastTruncated = (byte)(truncated ? 1 : 0);
-
-                _stepCount++;
-                if (_stepCount >= Mathf.Max(1, maxSteps) && _lastDone == 0 && _lastTruncated == 0)
-                    _lastTruncated = 1;
-            }
-
-            // capture after render
-            yield return eof;
-            CaptureIntoJpeg();
+        }
+        if (offRoad != null)
+        {
+            if (on) offRoad.OnOffRoadContact += HandleOffRoad;
+            else offRoad.OnOffRoadContact -= HandleOffRoad;
+        }
+        if (killZone != null)
+        {
+            if (on) killZone.OnKill += HandleKill;
+            else killZone.OnKill -= HandleKill;
         }
     }
 
-    private void CaptureIntoJpeg()
+    private void HandleFinalGoal()
     {
-        if (captureCamera == null || _readbackTex == null || _rt == null) return;
+        if (!_episodeDone && !_episodeTruncated)
+        {
+            _lastReward += 1.0f; // terminal reward
+            _episodeDone = true;
+        }
+    }
+
+    private void HandleMinorGoal()
+    {
+        if (!_episodeDone && !_episodeTruncated)
+            _lastReward += 0.2f; // shaping for minor goals
+    }
+
+    private void HandleOffRoad()
+    {
+        // Accumulate time-based penalty in FixedUpdate via _offRoadTimeAccum
+        _offRoadTimeAccum += Time.fixedDeltaTime;
+    }
+
+    private void HandleKill()
+    {
+        if (!_episodeDone && !_episodeTruncated)
+        {
+            _lastReward -= 1.0f;
+            _episodeTruncated = true; // e.g., fell off the map
+        }
+    }
+
+    // Physics & capture
+
+    void FixedUpdate()
+    {
+        // Apply the latest action mailbox (passive loop)
+        if (carController != null)
+        {
+            carController.SetInputs(_steerMailbox, _throttleMailbox);
+        }
+
+        // Compute reward for this physics tick
+        float r = 0f;
+        r += aliveReward;
+
+        if (carRb != null)
+        {
+            // forward speed along the car's forward axis
+            Vector3 v = carRb.velocity;
+            float forwardSpeed = Vector3.Dot(v, carRb.transform.forward);
+            r += Mathf.Max(0f, forwardSpeed) * forwardSpeedScale;
+        }
+
+        if (_offRoadTimeAccum > 1e-6f)
+        {
+            r -= offRoadPenaltyPerSec * _offRoadTimeAccum;
+            _offRoadTimeAccum = 0f;
+        }
+
+        _lastReward = r;
+
+        // Step count & auto-truncation
+        _stepCount++;
+        if (maxSteps > 0 && _stepCount >= maxSteps && !_episodeDone && !_episodeTruncated)
+        {
+            _episodeTruncated = true;
+        }
+    }
+
+    void LateUpdate()
+    {
+        // Handle reset request from network
+        if (_resetRequested)
+        {
+            _resetRequested = false;
+            BeginNewEpisode();
+        }
+
+        // Capture the current frame to JPEG (main thread only)
+        if (captureCamera == null || _rt == null || _readTex == null) return;
 
         var prev = RenderTexture.active;
+        RenderTexture.active = _rt;
+
+        // ensure camera rendered
+        captureCamera.Render();
+
+        _readTex.ReadPixels(new Rect(0, 0, outputWidth, outputHeight), 0, 0, false);
+        _readTex.Apply(false, false);
+
+        byte[] jpg = _readTex.EncodeToJPG(Mathf.Clamp(jpegQuality, 1, 100));
+        RenderTexture.active = prev;
+
+        lock (_jpegLock)
+        {
+            _jpegBytes = jpg;
+            _jpegLen = jpg?.Length ?? 0;
+            _jpegStepIndex = _stepCount;
+        }
+    }
+
+    private void BeginNewEpisode()
+    {
+        // Reset episode counters and flags
+        _stepCount = 0;
+        _episodeDone = false;
+        _episodeTruncated = false;
+        _lastReward = 0f;
+        _offRoadTimeAccum = 0f;
+
+        // Reset triggers
+        if (finalGoal != null) finalGoal.ResetForNewEpisode();
+        if (minorGoals != null)
+        {
+            foreach (var mg in minorGoals) if (mg != null) mg.ResetForNewEpisode();
+        }
+        if (offRoad != null) offRoad.ResetForNewEpisode();
+        if (killZone != null) killZone.ResetForNewEpisode();
+
+        // Reset car controller if it supports a reset
+        if (carController != null) carController.ResetVehicle();
+    }
+
+    // Networking
+
+    private void StartNetworkThread()
+    {
         try
         {
-            captureCamera.Render();
-            RenderTexture.active = _rt;
-            _readbackTex.ReadPixels(new Rect(0, 0, outputWidth, outputHeight), 0, 0, false);
-            _readbackTex.Apply(false, false);
-            byte[] jpg = _readbackTex.EncodeToJPG(Mathf.Clamp(jpegQuality, 10, 100));
-            lock (_jpegLock) { _latestJpeg = jpg; }
+            _listener = new TcpListener(IPAddress.Any, port);
+            _listener.Start();
+            Debug.Log($"[RLClientSender] listening on 0.0.0.0:{port}");
         }
         catch (Exception e)
         {
-            Debug.LogWarning("RLClientSender capture error: " + e.Message);
+            Debug.LogError($"[RLClientSender] Failed to start listener: {e}");
+            return;
         }
-        finally
-        {
-            RenderTexture.active = prev;
-        }
+
+        _netThread = new Thread(NetLoop) { IsBackground = true, Name = "RLClientSender.NetLoop" };
+        _netThread.Start();
     }
 
-    private void SafeSetInputs(float steer, float throttle)
-	{
-    	// Try a direct SetInputs(steer, throttle) method first
-    	try
-    	{
-        	var mi = controller.GetType().GetMethod(
-            	"SetInputs",
-            	BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
-            	null,
-            	new Type[] { typeof(float), typeof(float) },
-            	null
-        	);
-        	if (mi != null)
-        	{
-            	mi.Invoke(controller, new object[] { steer, throttle });
-            	return;
-        	}
-    	}
-    	catch { /* ignore and try fallbacks */ }
-
-    	// Fallbacks: try common field/property names
-    	if (!TrySetMember(controller, "steerInput", steer))
-        	if (!TrySetMember(controller, "steer", steer))
-            	TrySetMember(controller, "Steer", steer); // extra fallback (capitalized)
-
-    	if (!TrySetMember(controller, "throttleInput", throttle))
-        	if (!TrySetMember(controller, "throttle", throttle))
-            	TrySetMember(controller, "Throttle", throttle); // extra fallback (capitalized)
-	}
-
-    private bool TrySetMember(object obj, string name, float value)
+    private void StopNetworkThread()
     {
-        try
+        try { _listener?.Stop(); } catch { }
+        _listener = null;
+
+        if (_netThread != null)
         {
-            var t = obj.GetType();
-            var f = t.GetField(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-            if (f != null && f.FieldType == typeof(float)) { f.SetValue(obj, value); return true; }
-            var p = t.GetProperty(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-            if (p != null && p.CanWrite && p.PropertyType == typeof(float)) { p.SetValue(obj, value, null); return true; }
+            try { _netThread.Join(500); } catch { }
+            _netThread = null;
         }
-        catch {}
-        return false;
+        _clientConnected = false;
     }
 
-    // -------------------- Reward & Termination --------------------
-
-    private float ComputeRewardAndDone(out bool done, out bool truncated)
+    private static float ReadBEFloat(NetworkStream s)
     {
-        done = false;
-        truncated = false;
-
-        float r = 0f;
-
-        // 1) alive + forward velocity along car forward
-        float vForward = Vector3.Dot(rb.velocity, controller.transform.forward);
-        r += aliveReward;
-        r += forwardVelScale * Mathf.Max(0f, vForward);
-
-        // 2) route progress + heading alignment
-        if (_route != null)
-        {
-            Vector3 segDir;
-            float progressDelta = _route.Update(controller.transform.position, out segDir); // 0..1
-            r += progressRewardScale * progressDelta;
-
-            float headingErr = Vector3.SignedAngle(controller.transform.forward, segDir, Vector3.up);
-            float normHeadingErr = Mathf.Min(1f, Mathf.Abs(headingErr) / 90f); // ~1 at 90 deg
-            r -= headingPenaltyScale * normHeadingErr * Time.fixedDeltaTime;
-			// small lateral penalty to hug the centerline
-			r -= 0.02f * (_route != null ? _route.LastLateralMeters : 0f) * Time.fixedDeltaTime;
-        }
-
-        // 3) off-road penalty (set by OffRoadTrigger)
-        if (SharedEpisodeFlags.OffRoadContact)
-            r -= offRoadPenaltyPerStep;
-
-		int m = SharedEpisodeFlags.MinorGoalsReached;
-		if (m > _lastMinorCount) {
-    		r += minorGoalBonus * (m - _lastMinorCount);
-    		_lastMinorCount = m;
-		}
-
-        // 4) final goal reached
-        if (SharedEpisodeFlags.GoalReached)
-        {
-            r += SharedEpisodeFlags.GoalBonus;
-            done = true;
-            return r;
-        }
-
-        // 5) kill zone
-        if (SharedEpisodeFlags.KillNow)
-        {
-            r -= 1.0f;
-            done = true;
-            return r;
-        }
-
-        // 6) out-of-bounds
-        Vector3 p = controller.transform.position;
-        if (p.x < mapMinXZ.x || p.x > mapMaxXZ.x || p.z < mapMinXZ.y || p.z > mapMaxXZ.y)
-        {
-            r -= 1.0f;
-            truncated = true;
-            return r;
-        }
-
-        return r;
+        byte[] buf = ReadExact(s, 4);
+        if (BitConverter.IsLittleEndian) Array.Reverse(buf);
+        return BitConverter.ToSingle(buf, 0);
     }
 
-    // -------------------- Networking --------------------
+    private static void WriteBEFloat(NetworkStream s, float x)
+    {
+        byte[] buf = BitConverter.GetBytes(x);
+        if (BitConverter.IsLittleEndian) Array.Reverse(buf);
+        s.Write(buf, 0, 4);
+    }
+
+    private static void WriteBEU32(NetworkStream s, uint x)
+    {
+        byte[] buf = BitConverter.GetBytes(x);
+        if (BitConverter.IsLittleEndian) Array.Reverse(buf);
+        s.Write(buf, 0, 4);
+    }
+
+    private static byte[] ReadExact(NetworkStream s, int n)
+    {
+        byte[] buf = new byte[n];
+        int off = 0;
+        while (off < n)
+        {
+            int got = s.Read(buf, off, n - off);
+            if (got <= 0) throw new Exception("socket closed");
+            off += got;
+        }
+        return buf;
+    }
 
     private void NetLoop()
-	{
-    	try
-    	{
-        	while (_running)
-        	{
-            	using (var client = _listener.AcceptTcpClient())
-            	using (var ns = client.GetStream())
-            	{
-                	_clientConnected = true;
-                	ns.ReadTimeout = 20000;
-                	ns.WriteTimeout = 20000;
-
-                	// Wait for 'R' (reset) from client
-                	int b = ns.ReadByte();
-                	while (b != 'R')
-                	{
-                    	if (b < 0) throw new Exception("Client closed before reset");
-                    	b = ns.ReadByte();
-                	}
-
-                	// Ask main thread to reset episode (don’t touch Unity here)
-                	EnqueueOnMain(() => ResetEpisode(true));
-                	Thread.Sleep(netTickMs); // give main thread a tick
-                	SendObs(ns);             // sends latest JPEG + reward/done flags
-
-                	// Step loop: read two float32 (BE), set pending action, sleep, send obs
-                	var buf = new byte[8];
-                	while (_running && client.Connected)
-                	{
-                    	if (!ReadExact(ns, buf, 0, 8)) break;
-
-                    	float steer = ReadFloatBE(buf, 0);
-                    	float throttle = ReadFloatBE(buf, 4);
-                    	_pendingSteer = Mathf.Clamp(steer, -1f, 1f);
-                    	_pendingThrottle = Mathf.Clamp(throttle, 0f, 1f);
-                    	_havePendingAction = true;
-
-                    	Thread.Sleep(netTickMs); // let main thread step & capture
-                    	SendObs(ns);
-
-                    	if (_lastDone == 1 || _lastTruncated == 1)
-                    	{
-                        	// Wait for next 'R'
-                        	int r = ns.ReadByte();
-                        	while (r != 'R')
-                        	{
-                            	if (r < 0) throw new Exception("Client closed before next reset");
-                            	r = ns.ReadByte();
-                        	}
-                        	EnqueueOnMain(() => ResetEpisode(true));
-                        	Thread.Sleep(netTickMs);
-                        	SendObs(ns);
-                    	}
-                	}
-            	}
-            	_clientConnected = false;
-        	}
-    	}
-    	catch (ThreadInterruptedException) { /* exiting */ }
-    	catch (SocketException se) { Debug.LogWarning("NetLoop socket: " + se.Message); }
-    	catch (Exception e)       { Debug.LogWarning("NetLoop exception: " + e.Message); }
-    	finally { _clientConnected = false; }
-	}
-
-    private void SendObs(NetworkStream ns)
     {
-        byte[] jpg;
-        lock (_jpegLock) { jpg = _latestJpeg ?? Array.Empty<byte>(); }
-        int len = (jpg != null) ? jpg.Length : 0;
-
-        // header length (big-endian)
-        byte[] hdr = new byte[4];
-        hdr[0] = (byte)((len >> 24) & 0xFF);
-        hdr[1] = (byte)((len >> 16) & 0xFF);
-        hdr[2] = (byte)((len >> 8) & 0xFF);
-        hdr[3] = (byte)(len & 0xFF);
-        ns.Write(hdr, 0, 4);
-
-        if (len > 0) ns.Write(jpg, 0, len);
-
-        // tail: reward (float32 big-endian) + done byte + truncated byte
-        byte[] tail = new byte[6];
-        WriteFloatBE(tail, 0, _lastReward);
-        tail[4] = _lastDone;
-        tail[5] = _lastTruncated;
-        ns.Write(tail, 0, 6);
-        ns.Flush();
-    }
-
-    private static bool ReadExact(NetworkStream ns, byte[] buf, int off, int len)
-    {
-        int read = 0;
-        while (read < len)
+        while (!_shutdown)
         {
-            int r = ns.Read(buf, off + read, len - read);
-            if (r <= 0) return false;
-            read += r;
+            TcpClient client = null;
+            try
+            {
+                client = _listener.AcceptTcpClient();
+                client.NoDelay = true;
+                client.ReceiveTimeout = 15000;
+                client.SendTimeout = 15000;
+                _clientConnected = true;
+                Debug.Log("[RLClientSender] client connected");
+
+                using (var stream = client.GetStream())
+                {
+                    // episode loop
+                    while (!_shutdown && client.Connected)
+                    {
+                        // Wait for reset
+                        int b = stream.ReadByte();
+                        if (b == -1) break;
+                        if (b != (byte)'R')
+                        {
+                            Debug.LogWarning("[RLClientSender] Unexpected byte, waiting for 'R'.");
+                            continue;
+                        }
+
+                        // Request a new episode on main thread
+                        _resetRequested = true;
+
+                        // Give main thread a moment to run BeginNewEpisode and produce a frame
+                        Thread.Sleep(20);
+
+                        // Send first payload after reset
+                        SendLatestPayload(stream);
+
+                        // step loop
+                        while (!_shutdown && client.Connected)
+                        {
+                            // Receive action (steer, throttle) as BE float32
+                            float steer = ReadBEFloat(stream);
+                            float throttle = ReadBEFloat(stream);
+
+                            // Write to mailbox for main thread to apply in FixedUpdate
+                            _steerMailbox = Mathf.Clamp(steer, -1f, 1f);
+                            _throttleMailbox = Mathf.Clamp01(throttle);
+
+                            // Send next payload
+                            SendLatestPayload(stream);
+
+                            if (_episodeDone || _episodeTruncated)
+                            {
+                                // End of episode: break to wait for next 'R'
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            catch (ThreadAbortException) { }
+            catch (Exception e)
+            {
+                if (!_shutdown)
+                    Debug.LogWarning($"[RLClientSender] NetLoop exception: {e.Message}");
+            }
+            finally
+            {
+                try { client?.Close(); } catch { }
+                _clientConnected = false;
+            }
         }
-        return true;
     }
 
-    private static float ReadFloatBE(byte[] buf, int offset)
+    private void SendLatestPayload(NetworkStream stream)
     {
-        byte[] tmp = new byte[4];
-        Buffer.BlockCopy(buf, offset, tmp, 0, 4);
-        if (BitConverter.IsLittleEndian) Array.Reverse(tmp);
-        return BitConverter.ToSingle(tmp, 0);
+        // Snapshot shared fields under lock for consistency
+        byte[] jpg;
+        int len;
+        int stepIdx;
+        lock (_jpegLock)
+        {
+            jpg = _jpegBytes ?? Array.Empty<byte>();
+            len = _jpegLen;
+            stepIdx = _jpegStepIndex;
+        }
+
+        // Header: length (u32 BE)
+        WriteBEU32(stream, (uint)len);
+        // JPEG bytes
+        if (len > 0) stream.Write(jpg, 0, len);
+        // Tail: reward (f32 BE), done (u8), truncated (u8)
+        WriteBEFloat(stream, _lastReward);
+        stream.WriteByte(_episodeDone ? (byte)1 : (byte)0);
+        stream.WriteByte(_episodeTruncated ? (byte)1 : (byte)0);
+        stream.Flush();
     }
 
-    private static void WriteFloatBE(byte[] dst, int offset, float v)
-    {
-        byte[] bytes = BitConverter.GetBytes(v);
-        if (BitConverter.IsLittleEndian) Array.Reverse(bytes);
-        Buffer.BlockCopy(bytes, 0, dst, offset, 4);
-    }
+    // Debug overlay (optional)
 
-    private void EnqueueOnMain(Action a)
+    void OnGUI()
     {
-        lock (_mainQueue) _mainQueue.Enqueue(a);
-    }
-
-    // Optional: collision-based termination
-    void OnCollisionEnter(Collision c)
-    {
-        // Uncomment to kill on any collision:
-        // SharedEpisodeFlags.TriggerKill();
+        // Simple optional one-liner for quick debugging; toggle or remove if you use a HUD.
+        var rect = new Rect(10, 10, 600, 20);
+        string status = _clientConnected ? "client connected" : "listening";
+        GUI.Label(rect, $"RLClientSender: {status} | Step={_stepCount} Reward={_lastReward:+0.000;-0.000} MaxSteps={maxSteps} JPEG={jpegQuality}");
     }
 }

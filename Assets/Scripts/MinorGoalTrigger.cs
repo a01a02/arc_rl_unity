@@ -1,55 +1,36 @@
+/* MinorGoalTrigger
+ * Place on optional sub-goal triggers (e.g., waypoints). Each time the
+ * car enters, raises OnMinorGoal once per episode (per trigger).*/
+
+using System;
 using UnityEngine;
 
 [RequireComponent(typeof(Collider))]
 public class MinorGoalTrigger : MonoBehaviour
 {
-    [Tooltip("Optional sequential order (0,1,2,...). Set -1 to ignore order.")]
-    public int sequenceIndex = -1;
-    public bool oneShot = true;
-    public string playerTag = "Player";
+    public event Action OnMinorGoal;
 
-    private bool _consumed = false;
-    private Collider _col;
+    [Tooltip("Tag used by the agent/car root GameObject (optional).")]
+    public string carTag = "Player";
 
-    void Awake()
+    private bool _hit = false;
+
+    void Reset()
     {
-        _col = GetComponent<Collider>();
-        _col.isTrigger = true;
+        GetComponent<Collider>().isTrigger = true;
     }
 
     public void ResetForNewEpisode()
     {
-        _consumed = false;
-        if (_col != null) _col.enabled = true;
+        _hit = false;
     }
 
     void OnTriggerEnter(Collider other)
     {
-        if (_consumed && oneShot) return;
+        if (_hit) return;
+        if (!string.IsNullOrEmpty(carTag) && !other.CompareTag(carTag)) return;
 
-        bool isPlayer = (!string.IsNullOrEmpty(playerTag) && other.CompareTag(playerTag)) ||
-                        other.GetComponentInParent<SimpleCarController>() != null;
-        if (!isPlayer) return;
-
-        // (Optional) enforce order by sequenceIndex if you want — simplest: accept all
-        SharedEpisodeFlags.AddMinorGoal();
-
-        if (oneShot)
-        {
-            _consumed = true;
-            if (_col != null) _col.enabled = false;
-        }
+        _hit = true;
+        OnMinorGoal?.Invoke();
     }
-
-#if UNITY_EDITOR
-    void OnDrawGizmos()
-    {
-        Gizmos.color = Color.yellow;
-        var c = GetComponent<Collider>();
-        if (c is BoxCollider bc)
-            Gizmos.DrawWireCube(bc.bounds.center, bc.bounds.size);
-        else if (c is SphereCollider sc)
-            Gizmos.DrawWireSphere(sc.bounds.center, sc.radius);
-    }
-#endif
 }

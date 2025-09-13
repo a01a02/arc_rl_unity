@@ -1,64 +1,36 @@
-using UnityEngine;
-using System.IO;
+/* CameraIntrinsicsLogger
+ * Logs camera intrinsics to a YAML-like text file for reproducibility.
+ * Run once on Start, or call LogNow() manually. */
 
-/// <summary>
-/// Logs both native and "effective" intrinsics after crop+resize,
-/// to keep parity with the Python preprocessing.
-/// 
-/// If you crop in Python (recommended), set cropTopFrac and output size
-/// to match the Python constants so you can compute effective intrinsics here for reference.
-/// </summary>
+using System.IO;
+using UnityEngine;
+
+[RequireComponent(typeof(Camera))]
 public class CameraIntrinsicsLogger : MonoBehaviour
 {
-    public Camera cam;
-    [Header("Training-time Preprocess (for effective intrinsics)")]
-    [Range(0f, 0.9f)] public float cropTopFrac = 0.25f; // must match Python
-    public int outWidth = 84;
-    public int outHeight = 84;
-
-    public string outputPath = "CameraIntrinsics.yaml";
+    public string outputFile = "CameraIntrinsics.yaml";
+    public bool logOnStart = true;
 
     void Start()
     {
-        if (cam == null) cam = GetComponent<Camera>();
-        if (cam == null) { Debug.LogError("CameraIntrinsicsLogger: no Camera"); return; }
+        if (logOnStart) LogNow();
+    }
 
+    [ContextMenu("Log Now")]
+    public void LogNow()
+    {
+        var cam = GetComponent<Camera>();
         int w = cam.pixelWidth;
         int h = cam.pixelHeight;
-        float fx = cam.projectionMatrix[0,0] * 0.5f * w; // approximate; unity PM details vary
-        float fy = cam.projectionMatrix[1,1] * 0.5f * h;
-        float cx = w * 0.5f;
-        float cy = h * 0.5f;
+        float fx = (w / 2f) / Mathf.Tan(cam.fieldOfView * Mathf.Deg2Rad / 2f);
+        float fy = fx; // assuming square pixels for typical Unity camera
+        float cx = w / 2f;
+        float cy = h / 2f;
 
-        // Effective intrinsics (after top crop + resize)
-        int cropTop = Mathf.RoundToInt(h * cropTopFrac);
-        int hEffSrc = h - cropTop;
-        float sx = (float)outWidth / (float)w;
-        float sy = (float)outHeight / (float)hEffSrc;
+        string txt = $@"# Unity Camera Intrinsics width: {w} height: {h} fx: {fx} fy: {fy} cx: {cx} cy: {cy} fov_deg: {cam.fieldOfView} near: {cam.nearClipPlane} far: {cam.farClipPlane}";
 
-        float fxEff = fx * sx;
-        float fyEff = fy * sy;
-        float cxEff = cx * sx;                 // x-center unchanged (no horiz crop)
-        float cyEff = (cy - cropTop) * sy;     // y shifts by cropTop then scales
-
-        string yaml = ""
-            + "native:\n"
-            + $"  width: {w}\n"
-            + $"  height: {h}\n"
-            + $"  fx: {fx}\n"
-            + $"  fy: {fy}\n"
-            + $"  cx: {cx}\n"
-            + $"  cy: {cy}\n"
-            + "effective:\n"
-            + $"  crop_top_frac: {cropTopFrac}\n"
-            + $"  out_width: {outWidth}\n"
-            + $"  out_height: {outHeight}\n"
-            + $"  fx: {fxEff}\n"
-            + $"  fy: {fyEff}\n"
-            + $"  cx: {cxEff}\n"
-            + $"  cy: {cyEff}\n";
-
-        File.WriteAllText(outputPath, yaml);
-        Debug.Log($"Camera intrinsics saved to {outputPath}");
+        var path = Path.Combine(Application.persistentDataPath, outputFile);
+        File.WriteAllText(path, txt);
+        Debug.Log($"Camera intrinsics saved to {path}");
     }
 }

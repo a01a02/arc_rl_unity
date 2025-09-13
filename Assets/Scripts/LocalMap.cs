@@ -1,84 +1,47 @@
+/* LocalMap
+ * Simple debug overlay to show an egocentric trail of the car's recent positions.
+ * This is a purely visual aid and not used by control or rewards. */
+
+using System.Collections.Generic;
 using UnityEngine;
 
-/// <summary>
-/// Simple ego-centric local map stored on the car for telemetry/debugging.
-/// Not provided to the policy (keeps the system purely passive).
-/// - Tracks the car's trajectory since episode reset in a small occupancy texture.
-/// - Optionally displays the texture on a MeshRenderer (e.g., a small quad on the hood/UI).
-/// </summary>
 public class LocalMap : MonoBehaviour
 {
-    [Header("Map Settings")]
-    public int size = 128;                // pixels (square)
-    public float metersPerPixel = 0.1f;   // world meters per pixel
-    public int drawRadius = 1;            // pixels to thicken the trail
-    public Color trailColor = Color.white;
-    public Color backgroundColor = Color.black;
-    public int applyEveryNFrames = 3;     // apply texture less often to save CPU
+    public Transform carRoot;
+    public int maxTrailPoints = 300;
+    public float sampleEveryMeters = 0.5f;
+    public Color lineColor = new Color(1f, 1f, 1f, 0.9f);
+    public float lineWidth = 0.03f;
 
-    [Header("Optional Display")]
-    public MeshRenderer mapDisplay;       // assign a quad's renderer if you want to visualize
-    public string textureProperty = "_MainTex";
-
-    private Texture2D _tex;
-    private Vector3 _originPos;
-    private int _frameCounter = 0;
-    private Color[] _bgRow;
+    private LineRenderer _lr;
+    private readonly List<Vector3> _pts = new List<Vector3>();
+    private Vector3 _lastSamplePos;
 
     void Awake()
     {
-        _tex = new Texture2D(size, size, TextureFormat.RGB24, false);
-        _tex.filterMode = FilterMode.Point;
-        _bgRow = new Color[size];
-        for (int i = 0; i < size; i++) _bgRow[i] = backgroundColor;
-        Clear();
-        if (mapDisplay != null)
+        _lr = gameObject.AddComponent<LineRenderer>();
+        _lr.material = new Material(Shader.Find("Sprites/Default"));
+        _lr.startColor = _lr.endColor = lineColor;
+        _lr.widthMultiplier = lineWidth;
+        _lr.useWorldSpace = true;
+        _lr.numCapVertices = 4;
+        _lr.numCornerVertices = 4;
+    }
+
+    void Update()
+    {
+        if (carRoot == null) return;
+
+        if (_pts.Count == 0 || Vector3.Distance(carRoot.position, _lastSamplePos) >= sampleEveryMeters)
         {
-            var mat = mapDisplay.material;
-            mat.SetTexture(textureProperty, _tex);
-        }
-    }
+            _pts.Add(carRoot.position + Vector3.up * 0.02f);
+            _lastSamplePos = carRoot.position;
 
-    public void EpisodeReset()
-    {
-        _originPos = transform.position;
-        Clear();
-    }
+            if (_pts.Count > maxTrailPoints)
+                _pts.RemoveAt(0);
 
-    public void Clear()
-    {
-        for (int y = 0; y < size; y++)
-            _tex.SetPixels(0, y, size, 1, _bgRow);
-        _tex.Apply(false, false);
-    }
-
-    void FixedUpdate()
-    {
-        // position relative to origin set at episode reset
-        Vector3 d = transform.position - _originPos;
-        // project to XZ plane (Unity convention: X horizontal, Z forward)
-        float px = d.x / metersPerPixel + size * 0.5f;
-        float py = d.z / metersPerPixel + size * 0.5f;
-
-        DrawDot(Mathf.RoundToInt(px), Mathf.RoundToInt(py), drawRadius, trailColor);
-
-        _frameCounter++;
-        if (_frameCounter % applyEveryNFrames == 0)
-            _tex.Apply(false, false);
-    }
-
-    private void DrawDot(int cx, int cy, int radius, Color c)
-    {
-        int x0 = Mathf.Max(0, cx - radius);
-        int x1 = Mathf.Min(size - 1, cx + radius);
-        int y0 = Mathf.Max(0, cy - radius);
-        int y1 = Mathf.Min(size - 1, cy + radius);
-        for (int y = y0; y <= y1; y++)
-        {
-            for (int x = x0; x <= x1; x++)
-            {
-                _tex.SetPixel(x, y, c);
-            }
+            _lr.positionCount = _pts.Count;
+            _lr.SetPositions(_pts.ToArray());
         }
     }
 }

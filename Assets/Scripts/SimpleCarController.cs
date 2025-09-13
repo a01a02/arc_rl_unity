@@ -1,121 +1,82 @@
+/* SimpleCarController
+ * Lightweight car controller using Rigidbody kinematics suitable for 1/10th scale.
+ * It consumes (steer, throttle) from RLClientSender via SetInputs() and applies
+ * forward force and yaw using a bicycle-like approximation. No wheel colliders required.
+ * Public API:
+ *  - SetInputs(float steer [-1..1], float throttle [0..1])
+ *  - ResetVehicle()   // clears velocities; optional spawn
+ * Notes:
+ *  - This is intentionally simple and stable for RL. Tune accel/drag/maxSpeed/turnRate
+ *    for your scene scale. */
+
 using UnityEngine;
 
-/// <summary>
-/// Minimal continuous controller for a 4-wheeled car using WheelColliders.
-/// Exposes normalized steer/throttle and a collision flag.
-/// </summary>
 [RequireComponent(typeof(Rigidbody))]
 public class SimpleCarController : MonoBehaviour
 {
-    [Header("Wheels")]
-    public WheelCollider wheelFL;
-    public WheelCollider wheelFR;
-    public WheelCollider wheelRL;
-    public WheelCollider wheelRR;
+    [Header("Inputs (read-only outside)")]
+    [Range(-1f, 1f)] public float steerInput = 0f;
+    [Range(0f, 1f)] public float throttleInput = 0f;
 
-    [Header("Visuals (optional)")]
-    public Transform visualFL;
-    public Transform visualFR;
-    public Transform visualRL;
-    public Transform visualRR;
-
-    [Header("Params")]
-    public float maxSteerAngle = 30f;
-    public float maxMotorTorque = 150f;
-    public float brakeTorque = 300f;
+    [Header("Kinematic Params")]
+    public float accel = 12f; // m/s^2 per full throttle
+    public float drag = 1.5f; // linear drag factor
+    public float maxSpeed = 12f; // m/s
+    public float turnRateDeg = 140f; // deg/s at full steer (scaled by speed)
 
     [Header("Reset")]
-    public Transform spawnPoint;
+    public Transform optionalSpawn;  // if set, ResetVehicle() moves here
 
     private Rigidbody _rb;
-    private float _currentSteer;     // degrees
-    private float _currentTorque;    // Nm
-    private float _steerNorm;        // [-1,1]
-    private bool _collisionFlag = false;
 
-    public float CurrentSteerNorm => _steerNorm;
+    public Rigidbody Body => _rb;
 
     void Awake()
     {
         _rb = GetComponent<Rigidbody>();
-        // Optional stability
-        _rb.centerOfMass += new Vector3(0f, -0.3f, 0.2f);
+        _rb.interpolation = RigidbodyInterpolation.Interpolate;
+        _rb.constraints = RigidbodyConstraints.FreezeRotationX | RigidbodyConstraints.FreezeRotationZ; // keep upright
+        _rb.maxAngularVelocity = 100f;
     }
 
-    void FixedUpdate()
+    public void SetInputs(float steer, float throttle)
     {
-        ApplyToWheels();
-        UpdateVisuals();
-    }
-
-    public void SetInputs(float steerNorm, float throttleNorm)
-    {
-        _steerNorm = Mathf.Clamp(steerNorm, -1f, 1f);
-        float targetSteer = _steerNorm * maxSteerAngle;
-        float targetTorque = Mathf.Clamp01(throttleNorm) * maxMotorTorque;
-
-        // Small smoothing
-        _currentSteer = Mathf.Lerp(_currentSteer, targetSteer, 0.2f);
-        _currentTorque = Mathf.Lerp(_currentTorque, targetTorque, 0.2f);
-    }
-
-    private void ApplyToWheels()
-    {
-        // Steering on front
-        wheelFL.steerAngle = _currentSteer;
-        wheelFR.steerAngle = _currentSteer;
-
-        // Torque on rear (or AWD if you prefer)
-        wheelRL.motorTorque = _currentTorque;
-        wheelRR.motorTorque = _currentTorque;
-
-        // Simple automatic braking when torque very low
-        float brake = (_currentTorque < 0.05f) ? brakeTorque * 0.2f : 0f;
-        wheelFL.brakeTorque = brake;
-        wheelFR.brakeTorque = brake;
-        wheelRL.brakeTorque = brake;
-        wheelRR.brakeTorque = brake;
-    }
-
-    private void UpdateVisuals()
-    {
-        UpdateWheelPose(wheelFL, visualFL);
-        UpdateWheelPose(wheelFR, visualFR);
-        UpdateWheelPose(wheelRL, visualRL);
-        UpdateWheelPose(wheelRR, visualRR);
-    }
-
-    private void UpdateWheelPose(WheelCollider col, Transform visual)
-    {
-        if (col == null || visual == null) return;
-        Vector3 pos; Quaternion rot;
-        col.GetWorldPose(out pos, out rot);
-        visual.SetPositionAndRotation(pos, rot);
+        steerInput = Mathf.Clamp(steer, -1f, 1f);
+        throttleInput = Mathf.Clamp01(throttle);
     }
 
     public void ResetVehicle()
     {
-        if (spawnPoint != null)
+        if (optionalSpawn != null)
         {
-            transform.SetPositionAndRotation(spawnPoint.position, spawnPoint.rotation);
+            _rb.position = optionalSpawn.position;
+            _rb.rotation = optionalSpawn.rotation;
         }
-        _currentSteer = 0f;
-        _currentTorque = 0f;
-        _steerNorm = 0f;
-        _collisionFlag = false;
+        _rb.velocity = Vector3.zero;
+        _rb.angularVelocity = Vector3.zero;
+        steerInput = 0f;
+        throttleInput = 0f;
     }
 
-    public bool ConsumeCollisionFlag()
+    void FixedUpdate()
     {
-        bool f = _collisionFlag;
-        _collisionFlag = false;
-        return f;
-    }
+        float dt = Time.fixedDeltaTime;
 
-    void OnCollisionEnter(Collision c)
-    {
-        // Flag "meaningful" collisions; adjust threshold as needed
-        if (c.relativeVelocity.magnitude > 2.0f)
-            _collisionFlag = true;
+        // Forward accel + drag
+        Vector3 forward = transform.forward;
+        float vForward = Vector3.Dot(_rb.velocity, forward);
+        float a = accel * throttleInput - drag * vForward;
+        float vNew = Mathf.Clamp(vForward + a * dt, -maxSpeed, maxSpeed);
+
+        // Compose final velocity (keep lateral velocity small for stability)
+        Vector3 vel = forward * vNew;
+        vel.y = _rb.velocity.y; // preserve vertical
+        _rb.velocity = vel;
+
+        // Yaw from steer — scale by speed for stability
+        float speedFactor = Mathf.InverseLerp(0f, maxSpeed, Mathf.Abs(vNew));
+        float yawDeg = steerInput * turnRateDeg * speedFactor;
+        Quaternion dq = Quaternion.Euler(0f, yawDeg * dt, 0f);
+        _rb.MoveRotation(_rb.rotation * dq);
     }
 }
