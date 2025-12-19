@@ -1,52 +1,34 @@
-/* RewardFlagsHUD
- * Tiny HUD to show current step, reward, and termination flags from RLClientSender.
- * Toggle visibility with 'H' to avoid clutter. */
-
 using UnityEngine;
 
+[DisallowMultipleComponent]
 public class RewardFlagsHUD : MonoBehaviour
 {
-    public RLClientSender sender;
-    public KeyCode toggleKey = KeyCode.H;
+    [SerializeField] private RLClientSender sender;
+    [SerializeField] private bool show = true;
 
-    public Rect area = new Rect(10, 36, 520, 70);
-    private bool _visible = true;
-
-    GUIStyle _label, _labelShadow, _box;
-
-    void SetupStyles()
+    void Awake()
     {
-        if (_label != null) return;
-        _label = new GUIStyle(GUI.skin.label) { fontSize = 14 };
-        _labelShadow = new GUIStyle(_label);
-        _labelShadow.normal.textColor = new Color(0f, 0f, 0f, 0.75f);
-        _box = new GUIStyle(GUI.skin.box);
-        _box.normal.background = Texture2D.grayTexture;
-    }
-
-    void Update()
-    {
-        if (Input.GetKeyDown(toggleKey)) _visible = !_visible;
+        if (sender == null) sender = FindObjectOfType<RLClientSender>();
     }
 
     void OnGUI()
     {
-        if (!_visible || sender == null) return;
-        SetupStyles();
+        if (!show || sender == null) return;
 
-        GUILayout.BeginArea(area, _box);
+        var style = new GUIStyle(GUI.skin.label)
+        {
+            normal = { textColor = Color.black },
+            fontSize = 14
+        };
 
-        DrawShadowed($"Step={sender.StepCount}  Reward={sender.LastReward:+0.000;-0.000}");
-        DrawShadowed($"Done={sender.EpisodeDone}  Truncated={sender.EpisodeTruncated}  JPEG={sender.jpegQuality}  MaxSteps={sender.maxSteps}");
+        const int w = 360, h = 48;
+        int x = Screen.width - w - 8;
+        int y = Screen.height - h - 58; // sits above RLClientSender bottom box
+        GUI.Box(new Rect(x, y, w, h), GUIContent.none);
 
-        GUILayout.EndArea();
-    }
-
-    void DrawShadowed(string text)
-    {
-        var r = GUILayoutUtility.GetRect(new GUIContent(text), _label);
-        var s = r; s.x += 1; s.y += 1;
-        GUI.Label(s, text, _labelShadow);
-        GUI.Label(r, text, _label);
+        GUI.Label(new Rect(x + 8, y + 6, w - 16, 20),
+            $"Step={sender.StepCount}  R={sender.LastReward:+0.000;-0.000}", style);
+        GUI.Label(new Rect(x + 8, y + 24, w - 16, 20),
+            $"Done={sender.EpisodeDone}  Trunc={sender.EpisodeTruncated}", style);
     }
 }

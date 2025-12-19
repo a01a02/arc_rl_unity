@@ -1,89 +1,157 @@
 /*
- * RLClientSender
- * --------------
- * Unity-side TCP server that streams RGB frames + reward flags to a Python client
- * and receives (steer, throttle) actions each step.
- *
- * Protocol (matches live_unity_env.py):
- *  Reset:
- *    - Python → Unity: single byte 'R' (0x52)
- *    - Unity → Python: immediately sends  len(u32 BE) | jpeg(len) | reward(f32 BE) | done(u8) | truncated(u8)
- *  Step:
- *    - Python → Unity: steer(f32 BE) + throttle(f32 BE)
- *    - Unity → Python: len | jpeg | reward | done | truncated
- *
- * Observation: HWC uint8 RGB (e.g., 84x84x3), JPEG-encoded.
- * Action: steer ∈ [-1,1], throttle ∈ [0,1]
- *
- * Notes
- * - This component does NOT do any non-passive perception (no masks/flow).
- * - Rewards/terminations are determined by trigger components (Goal, MinorGoal,
- *   OffRoad, KillZone) and simple kinematics metrics (e.g., speed).
- * - Capturing occurs on the main thread (LateUpdate). Networking runs on a background
- *   thread reading actions and writing step payloads using thread-safe fields.
+ * RLClientSender.cs
+ * -----------------
+ * ROBOTICS PROTOCOL VERSION:
+ * - Implements "Passive Visual" Protocol:
+ * - Sends High-Level Commands (Left/Right/Follow) in _goalCos slot.
+ * - Sends '0' in _goalSin slot (prevents geometric cheating).
+ * - Includes Threading Fixes for Python sync.
+ * - Includes CaptureFrame method.
+ * - Includes AgentViewPIP integration for debugging.
+ * 
+ * CONTROLLER SUPPORT:
+ * - Supports both AckermannSteeringController (recommended for sim-to-real)
+ * - And AdvancedDoubleTrackController (for research/comparison)
+ * - Ackermann is checked first; falls back to DoubleTrack if not assigned.
  */
 
 using System;
-using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 using UnityEngine;
 
+// High-Level Navigation Command Enum
+public enum NavCommand { Follow = 0, Left = -1, Right = 1 }
+
 [DisallowMultipleComponent]
 public class RLClientSender : MonoBehaviour
 {
+    // ======== Network ========
     [Header("Network")]
-    [Tooltip("TCP port to listen on (Python connects to this).")]
     public int port = 5556;
+    [Tooltip("Socket read/write timeouts (ms).")]
+    public int socketTimeoutMs = 15000;
 
+    // ======== Capture ========
     [Header("Capture")]
     public Camera captureCamera;
-    [Tooltip("Output image width in pixels.")]
-    public int outputWidth = 84;
-    [Tooltip("Output image height in pixels.")]
-    public int outputHeight = 84;
-    [Range(1, 100)]
-    public int jpegQuality = 80;
+    public int outputWidth = 128;
+    public int outputHeight = 128;
+    [Range(1, 100)] public int jpegQuality = 80;
 
-    [Header("Control (read-only for other scripts)")]
-    [Tooltip("Last steer command received from Python [-1..1].")]
-    public float lastSteerCmd = 0f;
-    [Tooltip("Last throttle command received from Python [0..1].")]
-    public float lastThrottleCmd = 0f;
+    [Header("Camera Mount (capture only)")]
+    [Tooltip("Attach capture camera to the car root every frame (for Mac/Editor).")]
+    public bool lockCameraToCar = true;
+    public Vector3 camLocalPos = new Vector3(0f, 1.10f, 0f);
+    public Vector3 camLocalEuler = new Vector3(10f, 0f, 0f);
+    public bool zeroRoll = true;
+    [Tooltip("If true, force FOV on the capture camera.")]
+    public bool lockCameraIntrinsics = true;
+    public float cameraFov = 60f;
 
+    // ======== Control (mailbox) ========
+    [Header("Control (read-only)")]
+    [SerializeField, Range(-1f, 1f)] private float _lastSteerCmd = 0f;
+    [SerializeField, Range(0f, 1f)]  private float _lastThrottleCmd = 0f;
+    [SerializeField, Range(0f, 1f)]  private float _lastBrakeCmd = 0f;
+    public float LastSteer    => _lastSteerCmd;
+    public float LastThrottle => _lastThrottleCmd;
+    public float LastBrake    => _lastBrakeCmd;
+
+    // ======== Safety ========
+    [Header("Safety")]
+    [Tooltip("If no action arrives for this long, throttle is forced to 0.")]
+    public float commandTimeoutSec = 0.75f;
+
+    [Tooltip("Keep a tiny throttle right after reset to guarantee rolling even if first action is late.")]
+    public bool  startupKick = true;
+    [Range(0f, 1f)] public float startupKickThrottle = 0.18f;
+    public float startupKickDurationSec = 0.50f;
+
+    [Tooltip("If true, completely freeze vehicle when no Python client is connected.")]
+    public bool freezeWhenNoClient = true;
+
+    // ======== Episode ========
     [Header("Episode")]
     [Tooltip("Max physics steps before truncation (0 = unlimited).")]
     public int maxSteps = 500;
 
+    [Header("Episode Randomization")]
+    [Tooltip("If true, add small position/yaw jitter on each reset (F3 toggles at runtime).")]
+    public bool randomizeOnReset = false;
+    public Transform spawnAnchor;
+    public float spawnYawJitterDeg = 10f;
+    public float spawnPosJitterM = 0.5f;
+
+    private Vector3 _spawnPos;
+    private Quaternion _spawnRot;
+
+    // ======== References ========
     [Header("References")]
     public Rigidbody carRb;
-    public SimpleCarController carController;
 
-    [Header("Reward Configuration")]
-    [Tooltip("Small shaping reward each step while alive.")]
-    public float aliveReward = 0.01f;
-    [Tooltip("Scale for forward speed reward (m/s * scale).")]
-    public float forwardSpeedScale = 0.02f;
-    [Tooltip("Penalty per second when off road.")]
-    public float offRoadPenaltyPerSec = 0.5f;
+    [Tooltip("Preferred: Ackermann controller for sim-to-real (recommended).")]
+    public AckermannDriveController ackermannController;
 
-    [Header("Terminations / Flags (hook up triggers)")]
-    public GoalTrigger finalGoal;
-    public MinorGoalTrigger[] minorGoals;
-    public OffRoadTrigger offRoad;
+    [Tooltip("Alternative: Double-track controller for research (fallback if Ackermann not assigned).")]
+    public AdvancedDoubleTrackController doubleTrackController;
+
+    public RouteProgress routeProgress;
+
+    public Rigidbody CarBody => carRb;
+    
+    // CarRoot prioritizes Ackermann, then DoubleTrack, then raw Rigidbody
+    public Transform CarRoot =>
+        (ackermannController != null ? ackermannController.transform :
+         (doubleTrackController != null ? doubleTrackController.transform :
+          (carRb != null ? carRb.transform : null)));
+
+    // Helper to check which controller is active
+    public bool UsingAckermann => ackermannController != null;
+    public bool UsingDoubleTrack => ackermannController == null && doubleTrackController != null;
+
+    // ======== Terminations / Goals ========
+    [Header("Terminations / Goals")]
+    [Tooltip("Preferred: radius-based goal detector.")]
+    public GoalProximity finalGoalProx;
+
+    [Tooltip("Optional: kill/fall zone. Ends episode with -1.")]
     public KillZone killZone;
+    [Tooltip("Optional fallback Transform if no GoalProximity is set.")]
+    public Transform goalCenterFallback;
 
-    // internal state
+    // ======== Visuals ========
+    [Header("HUD")]
+    public bool showTopHUD = true;
+    public bool showBottomHUD = true;
 
-    // Episode state (read/written only on main thread)
-    private int _stepCount = 0;
-    private bool _episodeDone = false;
-    private bool _episodeTruncated = false;
+    [Header("Hotkeys")]
+    public KeyCode toggleTopHUDKey = KeyCode.F1;
+    public KeyCode toggleBottomHUDKey = KeyCode.F2;
+    public KeyCode toggleRandomizeKey = KeyCode.F3;
+
+    [Header("Waypoint Visualization")]
+    [Tooltip("Visualizes predicted waypoints from hierarchical policy.")]
+    public LearnedPathVisualizer pathVisualizer;
+    
+    [Tooltip("Optional: Raw Image to display Agent's View for debugging.")]
+    public UnityEngine.UI.RawImage agentViewPIP;
+
+    // ======== Internal state ========
+    private int   _stepCount = 0;
+    private bool  _episodeDone = false;
+    private bool  _episodeTruncated = false;
     private float _lastReward = 0f;
+    private volatile bool _episodeActive = false;
 
-    // Off-road contact timer
-    private float _offRoadTimeAccum = 0f;
+    public int   StepCount        => _stepCount;
+    public float LastReward       => _lastReward;
+    public bool  EpisodeDone      => _episodeDone;
+    public bool  EpisodeTruncated => _episodeTruncated;
+
+    public int EpisodeId { get; private set; } = 0;
+    public event System.Action OnEpisodeReset;
 
     // Networking
     private TcpListener _listener;
@@ -91,311 +159,525 @@ public class RLClientSender : MonoBehaviour
     private volatile bool _shutdown = false;
     private volatile bool _clientConnected = false;
 
-    // Shared payload fields (updated on main thread, read on net thread)
-    private readonly object _jpegLock = new object();
-    private byte[] _jpegBytes = Array.Empty<byte>();
-    private int _jpegLen = 0;
-    private volatile int _jpegStepIndex = -1; // step index that produced the jpeg
+    public bool IsListening       => _listener != null;
+    public bool IsClientConnected => _clientConnected;
 
-    // Action mailbox (written by net thread, read in FixedUpdate)
+    // Action mailbox
     private volatile float _steerMailbox = 0f;
     private volatile float _throttleMailbox = 0f;
+    private volatile float _brakeMailbox = 0f;
     private volatile bool _resetRequested = false;
+
+    // Timing
+    private static readonly System.Diagnostics.Stopwatch _wall = System.Diagnostics.Stopwatch.StartNew();
+    private long _lastCmdMs = long.MinValue;
+    private long _episodeStartMs = 0;
 
     // Capture resources
     private RenderTexture _rt;
     private Texture2D _readTex;
 
-    // Public accessors for HUDs
-    public int StepCount => _stepCount;
-    public float LastReward => _lastReward;
-    public bool EpisodeDone => _episodeDone;
-    public bool EpisodeTruncated => _episodeTruncated;
+    // Shared JPEG buffer
+    private readonly object _jpegLock = new object();
+    private byte[] _jpegBytes = Array.Empty<byte>();
+    private int _jpegLen = 0;
+
+    // Shared goal telemetry (The Critical Passive Visual Section)
+    private readonly object _telemetryLock = new object();
+    private float _goalCos = 0f, _goalSin = 0f, _goalDistXZ = -1f;
+
+    // Shared route metrics
+    private readonly object _routeLock = new object();
+    private float _latErr = 0f, _hdgErr = 0f, _kappa = 0f, _dsRoute = 0f;
+
+    // Shared proprio cache
+    private readonly object _propLock = new object();
+    private float _speedCached = 0f;
+    private float _yawRateCached = 0f;
+
+    // Frame-counting
+    private volatile int _frameNumber = 0;
+
+    // ======== Unity lifecycle ========
 
     void Awake()
     {
-        if (captureCamera == null)
-            Debug.LogError("[RLClientSender] Capture Camera not assigned.");
-
-        if (carRb == null && carController != null)
-            carRb = carController.GetComponent<Rigidbody>();
-
-        SetupRenderTargets();
-    }
-
-    void OnEnable()
-    {
-        _shutdown = false;
-        StartNetworkThread();
-        SubscribeTriggers(true);
-    }
-
-    void OnDisable()
-    {
-        _shutdown = true;
-        StopNetworkThread();
-        SubscribeTriggers(false);
-        TeardownRenderTargets();
-    }
-
-    void OnApplicationQuit()
-    {
-        _shutdown = true;
-        StopNetworkThread();
-    }
-
-    private void SetupRenderTargets()
-    {
-        _rt = new RenderTexture(outputWidth, outputHeight, 16, RenderTextureFormat.ARGB32)
+        InitCamera();
+        InitSpawn();
+        InitGoalListeners();
+        
+        // Log which controller is being used
+        if (ackermannController != null)
         {
-            antiAliasing = 1,
-            useMipMap = false
-        };
-        _rt.Create();
-
-        _readTex = new Texture2D(outputWidth, outputHeight, TextureFormat.RGB24, false);
-        _readTex.Apply(false, false);
-
-        if (captureCamera != null)
-            captureCamera.targetTexture = _rt;
-    }
-
-    private void TeardownRenderTargets()
-    {
-        if (captureCamera != null)
-            captureCamera.targetTexture = null;
-
-        if (_rt != null)
-        {
-            _rt.Release();
-            Destroy(_rt);
-            _rt = null;
+            Debug.Log("[RLClientSender] Using AckermannSteeringController (recommended for sim-to-real)");
         }
-
-        if (_readTex != null)
+        else if (doubleTrackController != null)
         {
-            Destroy(_readTex);
-            _readTex = null;
+            Debug.Log("[RLClientSender] Using AdvancedDoubleTrackController (research mode)");
+        }
+        else
+        {
+            Debug.LogWarning("[RLClientSender] No controller assigned! Using raw Rigidbody fallback.");
         }
     }
 
-    // Trigger wiring
-
-    private void SubscribeTriggers(bool on)
+    void Start()
     {
-        if (finalGoal != null)
-        {
-            if (on) finalGoal.OnGoalReached += HandleFinalGoal;
-            else finalGoal.OnGoalReached -= HandleFinalGoal;
-        }
-        if (minorGoals != null)
-        {
-            foreach (var mg in minorGoals)
-            {
-                if (mg == null) continue;
-                if (on) mg.OnMinorGoal += HandleMinorGoal;
-                else mg.OnMinorGoal -= HandleMinorGoal;
-            }
-        }
-        if (offRoad != null)
-        {
-            if (on) offRoad.OnOffRoadContact += HandleOffRoad;
-            else offRoad.OnOffRoadContact -= HandleOffRoad;
-        }
-        if (killZone != null)
-        {
-            if (on) killZone.OnKill += HandleKill;
-            else killZone.OnKill -= HandleKill;
-        }
+        StartListener();
     }
 
-    private void HandleFinalGoal()
+    void OnDestroy()
     {
-        if (!_episodeDone && !_episodeTruncated)
+        StopListener();
+        Cleanup();
+    }
+
+    void Update()
+    {
+        if (Input.GetKeyDown(toggleTopHUDKey)) showTopHUD = !showTopHUD;
+        if (Input.GetKeyDown(toggleBottomHUDKey)) showBottomHUD = !showBottomHUD;
+        if (Input.GetKeyDown(toggleRandomizeKey))
         {
-            _lastReward += 1.0f; // terminal reward
-            _episodeDone = true;
+            randomizeOnReset = !randomizeOnReset;
+            Debug.Log($"[RLClientSender] Randomization: {randomizeOnReset}");
+        }
+
+        if (_resetRequested)
+        {
+            _resetRequested = false;
+            ResetEpisode();
         }
     }
-
-    private void HandleMinorGoal()
-    {
-        if (!_episodeDone && !_episodeTruncated)
-            _lastReward += 0.2f; // shaping for minor goals
-    }
-
-    private void HandleOffRoad()
-    {
-        // Accumulate time-based penalty in FixedUpdate via _offRoadTimeAccum
-        _offRoadTimeAccum += Time.fixedDeltaTime;
-    }
-
-    private void HandleKill()
-    {
-        if (!_episodeDone && !_episodeTruncated)
-        {
-            _lastReward -= 1.0f;
-            _episodeTruncated = true; // e.g., fell off the map
-        }
-    }
-
-    // Physics & capture
 
     void FixedUpdate()
     {
-        // Apply the latest action mailbox (passive loop)
-        if (carController != null)
+        float s = _steerMailbox;
+        float t = _throttleMailbox;
+        float b = _brakeMailbox;
+
+        long dt = _wall.ElapsedMilliseconds - _lastCmdMs;
+        bool isTimeout = (dt > commandTimeoutSec * 1000f);
+
+        if (startupKick)
         {
-            carController.SetInputs(_steerMailbox, _throttleMailbox);
+            long sinceReset = _wall.ElapsedMilliseconds - _episodeStartMs;
+            if (sinceReset < startupKickDurationSec * 1000f)
+            {
+                t = Mathf.Max(t, startupKickThrottle);
+                isTimeout = false;
+            }
         }
 
-        // Compute reward for this physics tick
-        float r = 0f;
-        r += aliveReward;
-
-        if (carRb != null)
+        if (isTimeout)
         {
-            // forward speed along the car's forward axis
-            Vector3 v = carRb.velocity;
-            float forwardSpeed = Vector3.Dot(v, carRb.transform.forward);
-            r += Mathf.Max(0f, forwardSpeed) * forwardSpeedScale;
+            t = 0f; 
         }
 
-        if (_offRoadTimeAccum > 1e-6f)
+        _lastSteerCmd = s;
+        _lastThrottleCmd = t;
+        _lastBrakeCmd = b;
+
+        // Apply inputs to whichever controller is active
+        // Priority: Ackermann > DoubleTrack > Raw Rigidbody
+        if (ackermannController != null)
         {
-            r -= offRoadPenaltyPerSec * _offRoadTimeAccum;
-            _offRoadTimeAccum = 0f;
+            ackermannController.SetInputs(s, t, b);
+        }
+        else if (doubleTrackController != null)
+        {
+            doubleTrackController.SetInputs(s, t, b);
+        }
+        else if (carRb != null)
+        {
+            // Fallback: direct rigidbody control
+            carRb.AddTorque(0f, s * 5f, 0f);
+            carRb.AddForce(carRb.transform.forward * (t - b) * 10f);
         }
 
-        _lastReward = r;
-
-        // Step count & auto-truncation
-        _stepCount++;
-        if (maxSteps > 0 && _stepCount >= maxSteps && !_episodeDone && !_episodeTruncated)
+        if (_episodeActive)
         {
-            _episodeTruncated = true;
+            _stepCount++;
+            if (maxSteps > 0 && _stepCount >= maxSteps)
+            {
+                _episodeTruncated = true;
+                _episodeActive = false;
+                Debug.Log($"[RLClientSender] Episode truncated at {_stepCount} steps.");
+            }
+        }
+
+        // Get telemetry from active controller
+        float spd = 0f, yaw = 0f;
+        if (ackermannController != null)
+        {
+            spd = ackermannController.Speed;
+            yaw = ackermannController.YawRate;
+        }
+        else if (doubleTrackController != null)
+        {
+            spd = doubleTrackController.Speed;
+            yaw = doubleTrackController.YawRate;
+        }
+        else if (carRb != null)
+        {
+            spd = carRb.linearVelocity.magnitude;
+            yaw = carRb.angularVelocity.y;
+        }
+        
+        lock (_propLock)
+        {
+            _speedCached = spd;
+            _yawRateCached = yaw;
+        }
+
+        if (freezeWhenNoClient && !_clientConnected && carRb != null)
+        {
+            carRb.linearVelocity = Vector3.zero;
+            carRb.angularVelocity = Vector3.zero;
         }
     }
 
     void LateUpdate()
     {
-        // Handle reset request from network
-        if (_resetRequested)
+        if (lockCameraToCar && captureCamera != null && CarRoot != null)
         {
-            _resetRequested = false;
-            BeginNewEpisode();
+            captureCamera.transform.position = CarRoot.TransformPoint(camLocalPos);
+            var rot = CarRoot.rotation * Quaternion.Euler(camLocalEuler);
+            if (zeroRoll)
+            {
+                var e = rot.eulerAngles;
+                e.z = 0f;
+                rot = Quaternion.Euler(e);
+            }
+            captureCamera.transform.rotation = rot;
         }
 
-        // Capture the current frame to JPEG (main thread only)
-        if (captureCamera == null || _rt == null || _readTex == null) return;
+        if (lockCameraIntrinsics && captureCamera != null)
+        {
+            captureCamera.fieldOfView = cameraFov;
+        }
 
-        var prev = RenderTexture.active;
+        CaptureFrame();
+        UpdateGoalTelemetry();
+        UpdateRouteMetrics();
+        _frameNumber++;
+    }
+
+    // ======== Initialization ========
+
+    private void InitCamera()
+    {
+        if (captureCamera == null)
+        {
+            var go = GameObject.Find("CaptureCamera");
+            if (go != null) captureCamera = go.GetComponent<Camera>();
+        }
+
+        if (captureCamera != null)
+        {
+            _rt = new RenderTexture(outputWidth, outputHeight, 24);
+            _readTex = new Texture2D(outputWidth, outputHeight, TextureFormat.RGB24, false);
+            captureCamera.targetTexture = _rt;
+            captureCamera.enabled = true;
+
+            // Connect PIP
+            if (agentViewPIP != null)
+            {
+                agentViewPIP.texture = _rt;
+                agentViewPIP.color = Color.white;
+            }
+        }
+        else
+        {
+            Debug.LogWarning("[RLClientSender] No capture camera found!");
+        }
+    }
+
+    private void InitSpawn()
+    {
+        if (spawnAnchor == null)
+        {
+            spawnAnchor = GameObject.Find("SpawnPoint")?.transform;
+        }
+
+        if (spawnAnchor != null)
+        {
+            _spawnPos = spawnAnchor.position;
+            _spawnRot = spawnAnchor.rotation;
+        }
+        else if (CarRoot != null)
+        {
+            _spawnPos = CarRoot.position;
+            _spawnRot = CarRoot.rotation;
+        }
+        else
+        {
+            _spawnPos = Vector3.zero;
+            _spawnRot = Quaternion.identity;
+        }
+    }
+
+    private void InitGoalListeners()
+    {
+        if (finalGoalProx != null)
+        {
+            finalGoalProx.OnGoalReached += HandleGoalReached;
+        }
+
+        if (killZone != null)
+        {
+            killZone.OnKill += HandleKilled;
+        }
+    }
+
+    private void Cleanup()
+    {
+        if (finalGoalProx != null)
+        {
+            finalGoalProx.OnGoalReached -= HandleGoalReached;
+        }
+
+        if (killZone != null)
+        {
+            killZone.OnKill -= HandleKilled;
+        }
+
+        if (_rt != null)
+        {
+            _rt.Release();
+            Destroy(_rt);
+        }
+
+        if (_readTex != null)
+        {
+            Destroy(_readTex);
+        }
+    }
+
+    // ======== Episode management ========
+
+    private void ResetEpisode()
+    {
+        string controllerName = ackermannController != null ? "Ackermann" : 
+                               (doubleTrackController != null ? "DoubleTrack" : "None");
+        Debug.Log($"[RLClientSender] Resetting episode {EpisodeId} (Controller: {controllerName})");
+
+        _stepCount = 0;
+        _episodeDone = false;
+        _episodeTruncated = false;
+        _lastReward = 0f;
+        _episodeActive = true;
+        _episodeStartMs = _wall.ElapsedMilliseconds;
+        EpisodeId++;
+
+        if (CarRoot != null && carRb != null)
+        {
+            Vector3 pos = _spawnPos;
+            Quaternion rot = _spawnRot;
+
+            if (randomizeOnReset)
+            {
+                pos += new Vector3(
+                    UnityEngine.Random.Range(-spawnPosJitterM, spawnPosJitterM),
+                    0f,
+                    UnityEngine.Random.Range(-spawnPosJitterM, spawnPosJitterM)
+                );
+
+                float yawJitter = UnityEngine.Random.Range(-spawnYawJitterDeg, spawnYawJitterDeg);
+                rot = rot * Quaternion.Euler(0f, yawJitter, 0f);
+            }
+
+            CarRoot.position = pos;
+            CarRoot.rotation = rot;
+
+            carRb.linearVelocity = Vector3.zero;
+            carRb.angularVelocity = Vector3.zero;
+        }
+
+        // Reset the active controller
+        if (ackermannController != null) 
+        {
+            ackermannController.ResetVehicle();
+        }
+        else if (doubleTrackController != null) 
+        {
+            doubleTrackController.ResetVehicle();
+        }
+        
+        if (finalGoalProx != null) finalGoalProx.ResetForNewEpisode();
+        if (killZone != null) killZone.ResetForNewEpisode();
+
+        _steerMailbox = 0f;
+        _throttleMailbox = 0f;
+        _brakeMailbox = 0f;
+
+        OnEpisodeReset?.Invoke();
+    }
+
+    private void HandleGoalReached()
+    {
+        if (!_episodeDone && !_episodeTruncated)
+        {
+            Debug.Log("[RLClientSender] Goal reached!");
+            _episodeDone = true;
+            _episodeActive = false;
+            _lastReward = 10f;
+        }
+    }
+
+    private void HandleKilled()
+    {
+        if (!_episodeDone && !_episodeTruncated)
+        {
+            Debug.Log("[RLClientSender] Vehicle killed!");
+            _episodeTruncated = true;
+            _episodeActive = false;
+            _lastReward = -1f;
+        }
+    }
+
+    public void ExternalKill()
+    {
+        HandleKilled();
+    }
+
+    // ======== Frame Capture ========
+
+    private void CaptureFrame()
+    {
+        if (_rt == null || _readTex == null || captureCamera == null) return;
+
+        var oldRT = RenderTexture.active;
         RenderTexture.active = _rt;
-
-        // ensure camera rendered
         captureCamera.Render();
+        _readTex.ReadPixels(new Rect(0, 0, outputWidth, outputHeight), 0, 0);
+        _readTex.Apply();
+        RenderTexture.active = oldRT;
 
-        _readTex.ReadPixels(new Rect(0, 0, outputWidth, outputHeight), 0, 0, false);
-        _readTex.Apply(false, false);
-
-        byte[] jpg = _readTex.EncodeToJPG(Mathf.Clamp(jpegQuality, 1, 100));
-        RenderTexture.active = prev;
+        var jpg = _readTex.EncodeToJPG(jpegQuality);
 
         lock (_jpegLock)
         {
             _jpegBytes = jpg;
             _jpegLen = jpg?.Length ?? 0;
-            _jpegStepIndex = _stepCount;
         }
     }
 
-    private void BeginNewEpisode()
+    // --- PASSIVE VISUAL NAVIGATION LOGIC ---
+    private void UpdateGoalTelemetry()
     {
-        // Reset episode counters and flags
-        _stepCount = 0;
-        _episodeDone = false;
-        _episodeTruncated = false;
-        _lastReward = 0f;
-        _offRoadTimeAccum = 0f;
+        float c = 0f, s = 0f, d = -1f;
 
-        // Reset triggers
-        if (finalGoal != null) finalGoal.ResetForNewEpisode();
-        if (minorGoals != null)
+        // 1. Get Raw Geometry (Needed internally for Rewards)
+        if (finalGoalProx != null)
         {
-            foreach (var mg in minorGoals) if (mg != null) mg.ResetForNewEpisode();
+            finalGoalProx.GetDistances(out c, out s, out d);
         }
-        if (offRoad != null) offRoad.ResetForNewEpisode();
-        if (killZone != null) killZone.ResetForNewEpisode();
+        else if (goalCenterFallback != null && CarRoot != null)
+        {
+            Vector3 p = CarRoot.position;
+            Vector3 g = goalCenterFallback.position;
 
-        // Reset car controller if it supports a reset
-        if (carController != null) carController.ResetVehicle();
+            Vector2 fwd = new Vector2(CarRoot.forward.x, CarRoot.forward.z).normalized;
+            Vector2 dir = new Vector2(g.x - p.x, g.z - p.z);
+            d = dir.magnitude;
+
+            if (d > 1e-6f)
+            {
+                dir = dir.normalized;
+                c = Vector2.Dot(fwd, dir);
+                float cross = fwd.x * dir.y - fwd.y * dir.x;
+                s = Mathf.Sign(cross) * Mathf.Sqrt(Mathf.Max(0f, 1f - c * c));
+            }
+            else
+            {
+                c = 1f; s = 0f; d = 0f;
+            }
+        }
+
+        // 2. Calculate Command (Intent)
+        float command = (float)NavCommand.Follow;
+        
+        if (d > 15.0f) 
+        {
+            // If goal is to the left (sin > 0.4), command Left
+            if (s > 0.4f) command = (float)NavCommand.Left;
+            // If goal is to the right (sin < -0.4), command Right
+            else if (s < -0.4f) command = (float)NavCommand.Right;
+        }
+
+        lock (_telemetryLock)
+        {
+            // PROTOCOL:
+            // Slot 1 (GoalCos) -> Command (-1, 0, 1)
+            // Slot 2 (GoalSin) -> 0 (Unused/Hidden)
+            // Slot 3 (GoalDist) -> Distance (Used for reward only)
+            
+            _goalCos = command;
+            _goalSin = 0f;
+            _goalDistXZ = d;
+        }
     }
 
-    // Networking
-
-    private void StartNetworkThread()
+    private void UpdateRouteMetrics()
     {
+        float lat = 0f, hdg = 0f, kap = 0f, ds = 0f;
+
+        if (routeProgress != null)
+        {
+            lat = routeProgress.LateralErrorMeters;
+            hdg = routeProgress.HeadingErrorRad;
+            kap = routeProgress.PathCurvature;
+            ds = routeProgress.DeltaSPerStep;
+        }
+
+        lock (_routeLock)
+        {
+            _latErr = lat;
+            _hdgErr = hdg;
+            _kappa = kap;
+            _dsRoute = ds;
+        }
+    }
+
+    // ======== Networking ========
+
+    private void StartListener()
+    {
+        if (_listener != null) return;
+
         try
         {
             _listener = new TcpListener(IPAddress.Any, port);
-            _listener.Start();
-            Debug.Log($"[RLClientSender] listening on 0.0.0.0:{port}");
+            _listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+            _listener.Start(1);
+
+            _shutdown = false;
+            _netThread = new Thread(NetLoop) { IsBackground = true };
+            _netThread.Start();
+
+            Debug.Log($"[RLClientSender] Listening on port {port}");
         }
         catch (Exception e)
         {
-            Debug.LogError($"[RLClientSender] Failed to start listener: {e}");
-            return;
+            Debug.LogError($"[RLClientSender] Failed to start listener: {e.Message}");
+            _listener = null;
         }
-
-        _netThread = new Thread(NetLoop) { IsBackground = true, Name = "RLClientSender.NetLoop" };
-        _netThread.Start();
     }
 
-    private void StopNetworkThread()
+    private void StopListener()
     {
-        try { _listener?.Stop(); } catch { }
+        _shutdown = true;
+
+        try
+        {
+            _listener?.Stop();
+            _netThread?.Join(100);
+        }
+        catch { }
+
         _listener = null;
-
-        if (_netThread != null)
-        {
-            try { _netThread.Join(500); } catch { }
-            _netThread = null;
-        }
+        _netThread = null;
         _clientConnected = false;
-    }
-
-    private static float ReadBEFloat(NetworkStream s)
-    {
-        byte[] buf = ReadExact(s, 4);
-        if (BitConverter.IsLittleEndian) Array.Reverse(buf);
-        return BitConverter.ToSingle(buf, 0);
-    }
-
-    private static void WriteBEFloat(NetworkStream s, float x)
-    {
-        byte[] buf = BitConverter.GetBytes(x);
-        if (BitConverter.IsLittleEndian) Array.Reverse(buf);
-        s.Write(buf, 0, 4);
-    }
-
-    private static void WriteBEU32(NetworkStream s, uint x)
-    {
-        byte[] buf = BitConverter.GetBytes(x);
-        if (BitConverter.IsLittleEndian) Array.Reverse(buf);
-        s.Write(buf, 0, 4);
-    }
-
-    private static byte[] ReadExact(NetworkStream s, int n)
-    {
-        byte[] buf = new byte[n];
-        int off = 0;
-        while (off < n)
-        {
-            int got = s.Read(buf, off, n - off);
-            if (got <= 0) throw new Exception("socket closed");
-            off += got;
-        }
-        return buf;
     }
 
     private void NetLoop()
@@ -405,64 +687,126 @@ public class RLClientSender : MonoBehaviour
             TcpClient client = null;
             try
             {
+                if (!_listener.Pending())
+                {
+                    Thread.Sleep(50);
+                    continue;
+                }
+
                 client = _listener.AcceptTcpClient();
+                client.ReceiveTimeout = socketTimeoutMs;
+                client.SendTimeout = socketTimeoutMs;
                 client.NoDelay = true;
-                client.ReceiveTimeout = 15000;
-                client.SendTimeout = 15000;
+
                 _clientConnected = true;
                 Debug.Log("[RLClientSender] client connected");
 
                 using (var stream = client.GetStream())
                 {
-                    // episode loop
+                    int lastSentFrame = -1;
+                    bool cameFromResetInActionLoop = false; 
+
                     while (!_shutdown && client.Connected)
                     {
-                        // Wait for reset
-                        int b = stream.ReadByte();
-                        if (b == -1) break;
-                        if (b != (byte)'R')
+                        if (!cameFromResetInActionLoop)
                         {
-                            Debug.LogWarning("[RLClientSender] Unexpected byte, waiting for 'R'.");
-                            continue;
+                            int b;
+                            do
+                            {
+                                b = stream.ReadByte();
+                                if (b == -1) break; 
+
+                                if (b == (byte)'W')
+                                {
+                                    HandleWaypointMessage(stream);
+                                    continue; 
+                                }
+                            } while (b != (byte)'R');
+
+                            if (b == -1) break;
                         }
 
-                        // Request a new episode on main thread
+                        cameFromResetInActionLoop = false;
                         _resetRequested = true;
+                        
+                        // CRITICAL: Wait for main thread to process reset
+                        Thread.Sleep(50);
 
-                        // Give main thread a moment to run BeginNewEpisode and produce a frame
-                        Thread.Sleep(20);
-
-                        // Send first payload after reset
+                        _lastCmdMs = _wall.ElapsedMilliseconds;
+                        WaitForNewFrame(ref lastSentFrame, 500);
                         SendLatestPayload(stream);
 
-                        // step loop
                         while (!_shutdown && client.Connected)
                         {
-                            // Receive action (steer, throttle) as BE float32
-                            float steer = ReadBEFloat(stream);
-                            float throttle = ReadBEFloat(stream);
+                            int msgType = stream.ReadByte();
+                            if (msgType == -1) break; 
 
-                            // Write to mailbox for main thread to apply in FixedUpdate
-                            _steerMailbox = Mathf.Clamp(steer, -1f, 1f);
-                            _throttleMailbox = Mathf.Clamp01(throttle);
-
-                            // Send next payload
-                            SendLatestPayload(stream);
-
-                            if (_episodeDone || _episodeTruncated)
+                            if (msgType == (byte)'R')
                             {
-                                // End of episode: break to wait for next 'R'
+                                cameFromResetInActionLoop = true;
+                                _resetRequested = true;
+                                _lastCmdMs = _wall.ElapsedMilliseconds;
+                                break; 
+                            }
+                            else if (msgType == (byte)'W')
+                            {
+                                HandleWaypointMessage(stream);
+                                continue; 
+                            }
+                            else if (msgType == (byte)'A')
+                            {
+                                float steer    = ReadLEFloat(stream);
+                                float throttle = ReadLEFloat(stream);
+                                float brake    = ReadLEFloat(stream);
+
+                                if (float.IsNaN(steer)    || float.IsInfinity(steer))    steer    = 0f;
+                                if (float.IsNaN(throttle) || float.IsInfinity(throttle)) throttle = 0f;
+                                if (float.IsNaN(brake)    || float.IsInfinity(brake))    brake    = 0f;
+
+                                _steerMailbox    = Mathf.Clamp(steer, -1f, 1f);
+                                _throttleMailbox = Mathf.Clamp01(throttle);
+                                _brakeMailbox    = Mathf.Clamp01(brake);
+                                _lastCmdMs = _wall.ElapsedMilliseconds; 
+
+                                if (!WaitForNewFrame(ref lastSentFrame, 250))
+                                {
+                                    // timeout fallback
+                                }
+
+                                SendLatestPayload(stream);
+
+                                if (_episodeDone || _episodeTruncated)
+                                {
+                                    _episodeActive = false; 
+                                    break;
+                                }
+                            }
+                            else if (msgType == (byte)'Q')
+                            {
+                                Debug.Log("[RLClientSender] Quit command received");
+                                _shutdown = true;
                                 break;
+                            }
+                            else
+                            {
+                                Debug.LogWarning($"[RLClientSender] Unknown message type: {(char)msgType}");
+                                break; 
                             }
                         }
                     }
                 }
             }
-            catch (ThreadAbortException) { }
             catch (Exception e)
             {
                 if (!_shutdown)
-                    Debug.LogWarning($"[RLClientSender] NetLoop exception: {e.Message}");
+                {
+                    string msg = e.Message ?? "";
+                    if (msg.IndexOf("non-blocking", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        msg.IndexOf("timed out", StringComparison.OrdinalIgnoreCase) >= 0)
+                        Debug.Log($"[RLClientSender] NetLoop note: {msg}");
+                    else
+                        Debug.LogWarning($"[RLClientSender] NetLoop exception: {msg}");
+                }
             }
             finally
             {
@@ -472,37 +816,137 @@ public class RLClientSender : MonoBehaviour
         }
     }
 
-    private void SendLatestPayload(NetworkStream stream)
+    private void HandleWaypointMessage(NetworkStream stream)
     {
-        // Snapshot shared fields under lock for consistency
-        byte[] jpg;
-        int len;
-        int stepIdx;
-        lock (_jpegLock)
+        int numWaypoints = stream.ReadByte();
+        if (numWaypoints == -1 || numWaypoints > 20) return;
+
+        float[] waypoints = new float[numWaypoints * 2];
+        for (int i = 0; i < numWaypoints * 2; i++)
         {
-            jpg = _jpegBytes ?? Array.Empty<byte>();
-            len = _jpegLen;
-            stepIdx = _jpegStepIndex;
+            waypoints[i] = ReadLEFloat(stream);
         }
 
-        // Header: length (u32 BE)
+        if (pathVisualizer != null && numWaypoints > 0)
+        {
+            pathVisualizer.UpdateWaypoints(waypoints, numWaypoints);
+        }
+    }
+
+    private bool WaitForNewFrame(ref int lastFrame, int timeoutMs)
+    {
+        long start = _wall.ElapsedMilliseconds;
+        while (_frameNumber <= lastFrame)
+        {
+            if (_wall.ElapsedMilliseconds - start > timeoutMs)
+                return false;
+            Thread.Sleep(5);
+        }
+        lastFrame = _frameNumber;
+        return true;
+    }
+
+    private void SendLatestPayload(NetworkStream stream)
+    {
+        byte[] jpg; int len;
+        float goalCos, goalSin, goalDist;
+        float rew; bool done, trunc;
+        float lat, hdg, kap, ds;
+        float spd, yaw;
+
+        lock (_jpegLock) { jpg = _jpegBytes ?? Array.Empty<byte>(); len = _jpegLen; }
+        lock (_telemetryLock) { goalCos = _goalCos; goalSin = _goalSin; goalDist = _goalDistXZ; }
+        lock (_routeLock) { lat = _latErr; hdg = _hdgErr; kap = _kappa; ds = _dsRoute; }
+        lock (_propLock) { spd = _speedCached; yaw = _yawRateCached; }
+
+        rew   = _lastReward;
+        done  = _episodeDone;
+        trunc = _episodeTruncated;
+
         WriteBEU32(stream, (uint)len);
-        // JPEG bytes
         if (len > 0) stream.Write(jpg, 0, len);
-        // Tail: reward (f32 BE), done (u8), truncated (u8)
-        WriteBEFloat(stream, _lastReward);
-        stream.WriteByte(_episodeDone ? (byte)1 : (byte)0);
-        stream.WriteByte(_episodeTruncated ? (byte)1 : (byte)0);
+
+        // Send Command (Cos slot), 0 (Sin slot), Dist
+        WriteBEFloat(stream, goalCos);
+        WriteBEFloat(stream, goalSin);
+        WriteBEFloat(stream, goalDist);
+
+        WriteBEFloat(stream, spd);
+        WriteBEFloat(stream, yaw);
+        WriteBEFloat(stream, _lastSteerCmd);
+        WriteBEFloat(stream, _lastThrottleCmd);
+        WriteBEFloat(stream, _lastBrakeCmd);
+
+        WriteBEFloat(stream, lat);
+        WriteBEFloat(stream, hdg);
+        WriteBEFloat(stream, kap);
+        WriteBEFloat(stream, ds);
+
+        WriteBEFloat(stream, rew);
+        stream.WriteByte(done ? (byte)1 : (byte)0);
+        stream.WriteByte(trunc ? (byte)1 : (byte)0);
         stream.Flush();
     }
 
-    // Debug overlay (optional)
+    private static void WriteBEU32(NetworkStream s, uint val)
+    {
+        s.WriteByte((byte)(val >> 24)); s.WriteByte((byte)(val >> 16));
+        s.WriteByte((byte)(val >> 8)); s.WriteByte((byte)val);
+    }
+
+    private static void WriteBEFloat(NetworkStream s, float val)
+    {
+        byte[] b = BitConverter.GetBytes(val);
+        if (BitConverter.IsLittleEndian) Array.Reverse(b);
+        s.Write(b, 0, 4);
+    }
+
+    private static float ReadLEFloat(NetworkStream s)
+    {
+        byte[] b = new byte[4];
+        s.Read(b, 0, 4);
+        if (!BitConverter.IsLittleEndian) Array.Reverse(b);
+        return BitConverter.ToSingle(b, 0);
+    }
 
     void OnGUI()
     {
-        // Simple optional one-liner for quick debugging; toggle or remove if you use a HUD.
-        var rect = new Rect(10, 10, 600, 20);
-        string status = _clientConnected ? "client connected" : "listening";
-        GUI.Label(rect, $"RLClientSender: {status} | Step={_stepCount} Reward={_lastReward:+0.000;-0.000} MaxSteps={maxSteps} JPEG={jpegQuality}");
+        GUI.depth = 0;
+        var black = new GUIStyle(GUI.skin.label);
+        black.normal.textColor = Color.black;
+        black.alignment = TextAnchor.UpperLeft;
+        black.fontSize = 14;
+
+        if (showTopHUD)
+        {
+            const int w = 980, h = 24;
+            GUI.Box(new Rect(8, 8, w, h), GUIContent.none);
+            string status = _clientConnected ? "client connected" : "listening";
+            string controller = ackermannController != null ? "Ackermann" : 
+                               (doubleTrackController != null ? "DoubleTrack" : "None");
+            GUI.Label(new Rect(12, 12, w - 8, h),
+                $"RLClientSender: {status} | Controller: {controller} | Step={_stepCount} Reward={_lastReward:+0.000;-0.000} Done={_episodeDone} Trunc={_episodeTruncated}", black);
+        }
+
+        if (showBottomHUD)
+        {
+            const int w = 1280, h = 40;
+            int y = Screen.height - h - 10;
+            GUI.Box(new Rect(8, y, w, h), GUIContent.none);
+
+            float cmd, zero, d;
+            lock (_telemetryLock) { cmd = _goalCos; zero = _goalSin; d = _goalDistXZ; }
+            float spd, yaw;
+            lock (_propLock) { spd = _speedCached; yaw = _yawRateCached; }
+
+            string cmdStr = "Follow";
+            if (Mathf.Approximately(cmd, -1f)) cmdStr = "Left";
+            else if (Mathf.Approximately(cmd, 1f)) cmdStr = "Right";
+
+            GUI.Label(new Rect(12, y + 6, w - 8, h - 6),
+                $"Command: {cmdStr} (dist={d:0.0}m)   |   " +
+                $"Act: steer={_lastSteerCmd:+0.00;-0.00}  thr={_lastThrottleCmd:0.00}  brk={_lastBrakeCmd:0.00}   |   " +
+                $"Speed={spd:0.00} m/s  YawRate={yaw:+0.00;-0.00} rad/s", black);
+        }
     }
 }
